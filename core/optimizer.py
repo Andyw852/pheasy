@@ -638,19 +638,90 @@ class TwoLevelSM(_TL_LO):
         return _rfe_spmv_T(self.NS, np.ascontiguousarray(t, dtype=self._dt), self._dt)
 
     def col_norms(self, block=4096):
-        """RFE 特征排序用列范数. 精确 ||SM[:,j]|| 需扫 SM_prime N 遍(实测
-        27min/块 不可行), 改用 NS 列范数近似, 秒算.
+        """RFE 特征排序用列范数 = 真实 ||SM[:, j]||, SM = SM_prime @ NS.
+
+        [FIX colnorm 2026-08] 旧实现返回 ||NS[:, j]||. NS 是对称性约束零空间的
+        SVD 正交基, 列范数恒等于 1 -> min=max=1.00e+00, 归一化完全失效:
+          * _ridge_lsmr 里的 _inv_d 全为 1, 列缩放没起作用;
+          * fit() 里 |coef|*col_norms 退化成裸 |coef|, 而 2 阶列量纲 eV/A^2、
+            3 阶 eV/A^3, 位移 RMS ~0.017 A 使两者尺度差约两个数量级
+            -> RFE 变成"按量纲排序", 一剪 CV 就崩.
+
+        精确算法要对全部 m 行做 SpMM (旧注释实测 27min/块). 这里改为按行子采样:
+        ||SM[:,j]||^2 的行求和是可无偏估计的, 抽 f 帧后乘 sqrt(m/m_sub) 还原.
+        相对误差 ~1/sqrt(m_sub); 24 帧 x 1488 行 = 3.6e4 行 -> ~0.5%,
+        对排序绰绰有余, 耗时降到全量的 ~1/29.
+
+        env:
+            PHEASY_COLNORM_FRAMES  抽样帧数 (default 24; <=0 或 >=总帧数 = 精确)
+            PHEASY_COLNORM_EXACT   =1 强制全量精确
+            PHEASY_CV_GROUP_SIZE   每帧行数 = 3 x 超胞原子数 (用于按帧抽样)
         """
         import numpy as _np
         import time as _t
         _t0 = _t.time()
+
+        m, p = self.SM_prime.shape
+        n = self.NS.shape[1]
+        _exact = os.environ.get("PHEASY_COLNORM_EXACT", "0").lower() in ("1", "true", "yes")
+        _nf = int(os.environ.get("PHEASY_COLNORM_FRAMES", "24"))
+        _gs = int(os.environ.get("PHEASY_CV_GROUP_SIZE", "0"))
+
+        # ── 选行 ────────────────────────────────────────────────────────────
+        _rng = _np.random.default_rng(12345)
+        if _exact or _nf <= 0:
+            _A, _scale, _how = self.SM_prime, 1.0, f"exact ({m} 行)"
+        elif _gs > 0 and m % _gs == 0 and _nf < m // _gs:
+            # 按整帧抽样: 同帧内 3N 行强相关, 整帧取更能代表真实行分布
+            _ntot = m // _gs
+            _f = _np.sort(_rng.choice(_ntot, size=_nf, replace=False))
+            _rows = (_f[:, None] * _gs + _np.arange(_gs)[None, :]).ravel()
+            _A = self.SM_prime[_rows]
+            _scale = _np.sqrt(_ntot / float(_nf))
+            _how = f"{_nf}/{_ntot} 帧抽样 ({len(_rows)} 行)"
+        else:
+            # 无 group 信息 (或帧数不足): 退回随机行抽样, 同样无偏
+            _nr = min(m, max(20000, _nf * 1500))
+            _rows = _np.sort(_rng.choice(m, size=_nr, replace=False))
+            _A = self.SM_prime[_rows]
+            _scale = _np.sqrt(m / float(_nr))
+            _how = f"{_nr}/{m} 随机行抽样"
+            if _gs > 0 and m % _gs != 0:
+                print(f"[TwoLevelSM.col_norms] WARNING: m={m} 不能被 "
+                      f"PHEASY_CV_GROUP_SIZE={_gs} 整除, 退回随机行抽样", flush=True)
+
+        if _A.format != 'csr':
+            _A = _A.tocsr()
         _NS = self.NS.tocsc() if self.NS.format != 'csc' else self.NS
-        _sq = _NS.multiply(_NS)
-        _ss = _np.asarray(_sq.sum(axis=0)).ravel()
-        cn = _np.sqrt(_ss.astype(_np.float64))
+
+        # ── 分块 SpMM: SM_sub[:, blk] = A @ NS[:, blk], 只留列平方和 ────────
+        _sq = _np.zeros(n, dtype=_np.float64)
+        for _j0 in range(0, n, block):
+            _j1 = min(_j0 + block, n)
+            _B = _NS[:, _j0:_j1]
+            _B = _np.ascontiguousarray(_B.toarray(), dtype=self._dt)
+            if _RFE_USE_MKL:
+                _S = _mkl_dot_rfe(_A, _B)
+            else:
+                _S = _A @ _B
+            _S = _np.asarray(_S)
+            _sq[_j0:_j1] = _np.einsum('ij,ij->j', _S, _S, dtype=_np.float64)
+            del _S, _B
+
+        cn = _scale * _np.sqrt(_sq)
         _nz = int((cn > 1e-30).sum())
-        print(f"[TwoLevelSM.col_norms] NS 近似列范数 {_t.time()-_t0:.1f}s, "
-              f"nz={_nz}/{len(cn)}", flush=True)
+        _pos = cn[cn > 1e-30]
+        print(f"[TwoLevelSM.col_norms] 真实 SM 列范数 [{_how}] "
+              f"{_t.time()-_t0:.1f}s, nz={_nz}/{n}", flush=True)
+        if _nz:
+            _rng_ratio = float(_pos.max() / _pos.min())
+            print(f"[TwoLevelSM.col_norms] min={_pos.min():.4e}, "
+                  f"max={_pos.max():.4e}, median={_np.median(_pos):.4e}, "
+                  f"max/min={_rng_ratio:.2e}", flush=True)
+            if _rng_ratio < 1.5:
+                print("[TwoLevelSM.col_norms] WARNING: 列范数动态范围 < 1.5. "
+                      "真实设计矩阵不应如此均匀 —— 极可能仍在对 NS 求范数, "
+                      "请检查 SM_prime/NS 是否传反.", flush=True)
         return cn
 
 
@@ -857,6 +928,11 @@ class PheasyRFECV:
             groups = np.arange(n_rows) // group_size
             gkf = GroupKFold(n_splits=self.cv)
             splits = list(gkf.split(np.arange(n_rows), groups=groups))
+            # [FIX cvlog] 显式确认按构型分折已生效 (原来只有失败时才打印)
+            if self.verbose and active_idx.size == self.n_features_in_:
+                print(f"[PheasyRFECV/cv] GroupKFold 按构型分折: "
+                      f"{n_rows // group_size} 帧 × {group_size} 行 → "
+                      f"{self.cv} 折, 无配置内泄漏.", flush=True)
         else:
             if self.verbose and active_idx.size == self.n_features_in_:
                 print("[PheasyRFECV] WARNING: PHEASY_CV_GROUP_SIZE 未设置, "
@@ -878,7 +954,9 @@ class PheasyRFECV:
         mse_list = Parallel(n_jobs=n_par, prefer="threads")(
             delayed(_fold)(tr, va) for tr, va in splits
         )
-        return float(np.sqrt(np.mean(mse_list)))
+        # [FIX 1se] 同时返回逐折 RMSE, 供 fit() 计算标准误做 1-SE 选型
+        fold_rmse = np.sqrt(np.asarray(mse_list, dtype=np.float64))
+        return float(np.sqrt(np.mean(mse_list))), fold_rmse
 
     def fit(self, SM, y, sample_weight=None):
         import time as _t
@@ -942,6 +1020,11 @@ class PheasyRFECV:
         _patience = int(os.environ.get("PHEASY_RFE_PATIENCE", "5"))
         _rel_tol  = float(os.environ.get("PHEASY_RFE_TOL", "0.005"))
         n_no_improve = 0
+        # [FIX 1se] 选型规则: argmin 会把噪声级"改善"(如 0.14% < rel_tol)当成最优,
+        # 与 rel_tol 判停自相矛盾. 1-SE 规则 = 在 CV 落入 (min + 1 标准误) 的模型里
+        # 取最简者, 是 RFECV/glmnet 的标准做法, 也让 rel_tol 真正生效.
+        _one_se = os.environ.get("PHEASY_RFE_ONE_SE", "1").lower() in ("1", "true", "yes")
+        _history = []
 
         if self.verbose:
             print(
@@ -952,7 +1035,8 @@ class PheasyRFECV:
                 flush=True,
             )
             print(f"[PheasyRFECV] 判停: patience={_patience}, "
-                  f"rel_tol={_rel_tol:.3g} (最终取历史 argmin)", flush=True)
+                  f"rel_tol={_rel_tol:.3g} | 选型: "
+                  f"{'1-SE 规则' if _one_se else '历史 argmin'}", flush=True)
 
         while n_active > self.min_features:
             t0 = _t.time()
@@ -969,14 +1053,20 @@ class PheasyRFECV:
                     print(f"[PheasyRFECV/warmstart] enabled, "
                           f"Round 1+ will use Round 0 coef as x0", flush=True)
 
-            cv_rmse = self._cv_rmse(SM, active_idx, y)
+            cv_rmse, _fold_rmse = self._cv_rmse(SM, active_idx, y)
+
+            # [FIX 1se] 记录历史: (n_active, CV_RMSE, SE, active mask)
+            _se = (float(_fold_rmse.std(ddof=1) / np.sqrt(len(_fold_rmse)))
+                   if len(_fold_rmse) > 1 else 0.0)
+            _history.append((n_active, cv_rmse, _se, active.copy()))
 
             elapsed = _t.time() - t0
             if self.verbose:
                 print(
                     f"[PheasyRFECV] Round {round_num:3d}: "
                     f"n_active={n_active:6d}  "
-                    f"CV_RMSE={cv_rmse:.6e}  "
+                    f"CV_RMSE={cv_rmse:.6e} ± {_se:.2e}  "
+                    f"fold=[{_fold_rmse.min():.3e},{_fold_rmse.max():.3e}]  "
                     f"nonzero={int(np.count_nonzero(coef_active)):6d}  "
                     f"t={elapsed:.0f}s",
                     flush=True,
@@ -1022,6 +1112,26 @@ class PheasyRFECV:
                 break
 
         self.n_iter_ = round_num
+
+        # [FIX 1se] 用 1-SE 规则从历史中选型 (默认开启)
+        if _one_se and _history:
+            _i_min = int(np.argmin([h[1] for h in _history]))
+            _n_min, _m_min, _se_min, _act_min = _history[_i_min]
+            _thr = _m_min + _se_min
+            _cands = [h for h in _history if h[1] <= _thr]
+            _chosen = min(_cands, key=lambda h: h[0])
+            if self.verbose:
+                print(f"[PheasyRFECV] argmin : n_active={_n_min}, "
+                      f"CV={_m_min:.6e} ± {_se_min:.2e}", flush=True)
+                print(f"[PheasyRFECV] 1-SE   : n_active={_chosen[0]}, "
+                      f"CV={_chosen[1]:.6e}  (阈值 {_thr:.6e})", flush=True)
+                _n_max = max(h[0] for h in _history)
+                if _chosen[0] == _n_max:
+                    print("[PheasyRFECV] NOTE: 1-SE 选中全特征集 —— "
+                          "该体系超定充分, 特征选择无收益; "
+                          "直接用 OLS/ridge 可省掉整轮 RFE 开销.", flush=True)
+            best_active = _chosen[3]
+            best_rmse   = _chosen[1]
 
         # 最终拟合: 最佳活跃集 + 全数据
         best_idx = np.where(best_active)[0]
