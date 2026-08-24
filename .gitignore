@@ -1,2 +1,6 @@
 *.bak*
 __pycache__/
+
+# local verification data and download staging
+MnIn2Se4_lasso/
+.staging/

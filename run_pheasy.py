@@ -45,6 +45,10 @@ def _build_sensing_matrix_sparse(CS_full, u):
     return _sp.csr_matrix(_mat.astype(_np.float32, copy=False))
 
 from pheasy.core.forces import read_interatomic_forces, read_interatomic_forces_aimd
+try:  # [PATCH sm-dtype]
+    from .core.utilities import get_sm_dtype as _sm_dtype
+except ImportError:
+    from pheasy.core.utilities import get_sm_dtype as _sm_dtype
 
 
 class WorkFlow(object):
@@ -424,7 +428,7 @@ class WorkFlow(object):
             # block (~1.34 GB) to CSR float32 (~0.06 GB), pop as we go to
             # release dense memory, then sparse-vstack at the end.
             import time as _t_sm
-            print(f'[SM] streaming dense->sparse f32 conversion of '
+            print(f'[SM] streaming dense->sparse {np.dtype(_sm_dtype()).name} conversion of '
                   f'{len(sensing_mat_list)} blocks...', flush=True)
             _t0 = _t_sm.time()
             _sparse_blocks = []
@@ -435,7 +439,7 @@ class WorkFlow(object):
                     if _b.format != 'csr':
                         _b = _b.tocsr()
                     if _b.dtype != np.float32:
-                        _b = _b.astype(np.float32)
+                        _b = _b.astype(_sm_dtype())
                 else:
                     # 串行 fallback 路径仍可能给 dense
                     _b = spmat.csr_matrix(_b, dtype=np.float32)
@@ -496,12 +500,12 @@ class WorkFlow(object):
             else:
                 SM_prime = _sm
             if SM_prime.dtype != np.float32:
-                SM_prime = SM_prime.astype(np.float32)
+                SM_prime = SM_prime.astype(_sm_dtype())
             _mem = (SM_prime.data.nbytes
                     + SM_prime.indices.nbytes
                     + SM_prime.indptr.nbytes) / 1e9
             logger.info(
-                f'SM_prime kept sparse f32 CSR: shape={SM_prime.shape}, '
+                f'SM_prime kept sparse {SM_prime.dtype} CSR: shape={SM_prime.shape}, '
                 f'nnz={SM_prime.nnz}, mem={_mem:.2f} GB'
             )
 
@@ -554,7 +558,7 @@ class WorkFlow(object):
                             break
                         f_matrix_new = f_matrix[n,:,:]
                         f_matrix_use.append(f_matrix_new)
-                FM = np.vstack(f_matrix_use).flatten().astype(np.float32)
+                FM = np.vstack(f_matrix_use).flatten().astype(_sm_dtype())
                 if settings.EXCLUDE is not None:
                     sensing_mat_list = deque()
                     for n in range(settings.NDATA):
@@ -948,7 +952,7 @@ class WorkFlow(object):
                             print(f'[SM-cache] loaded in {_ts.time()-_t0:.1f}s', flush=True)
                             del SM_prime
                         else:
-                            _NS = self.NS_full.toarray().astype(np.float32)
+                            _NS = self.NS_full.toarray().astype(_sm_dtype())
                             _n_thr = int(_os_p.environ.get('PHEASY_DOT_THREADS', _os_p.environ.get('OMP_NUM_THREADS','64')))
                             print(f'[PATCH] parallel sparse.dot: {SM_prime.shape} x {_NS.shape}, threads={_n_thr}', flush=True)
                             SM = _np_p.empty((SM_prime.shape[0], _NS.shape[1]), dtype=_np_p.float32)
@@ -969,7 +973,7 @@ class WorkFlow(object):
                                 print(f'[SM-cache] saved in {_ts.time()-_t0:.1f}s', flush=True)
                             except Exception as _e:
                                 print(f'[SM-cache] save fail: {_e}', flush=True)
-                FM = FM.astype(np.float32)
+                FM = FM.astype(_sm_dtype())
 
             # Train interatomic force constants
             # PATCH: optionally redirect LASSO -> ALASSO via env var

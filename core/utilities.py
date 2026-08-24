@@ -24,6 +24,8 @@ from collections import deque
 
 import numpy as np
 from scipy.sparse import coo_matrix, issparse, kron
+import os as _os_smd  # [PATCH sm-dtype]
+import numpy as _np_smd  # [PATCH sm-dtype]
 
 
 def kron_product(mat, times=2):
@@ -415,3 +417,52 @@ def null_space_dense(mat, eps=1e-4):
             ]
 
     return null_space
+
+
+
+# ---------------------------------------------------------------------------
+# [PATCH sm-dtype] 线性系统统一浮点精度
+# ---------------------------------------------------------------------------
+_SM_DTYPES = {
+    "float32": _np_smd.float32, "f32": _np_smd.float32, "single": _np_smd.float32,
+    "float64": _np_smd.float64, "f64": _np_smd.float64, "double": _np_smd.float64,
+}
+
+
+def get_sm_dtype(default="float64"):
+    """sensing matrix 及其下游矩阵 (SM_prime / NS / FM / X) 的浮点精度。
+
+    由环境变量 ``PHEASY_SM_DTYPE`` 控制, 取值 ``float32`` (默认) 或 ``float64``。
+
+    float32 内存减半, 但 lsmr 只能收敛到约 1e-7 相对精度 (istop=5);
+    float64 精度更高而内存翻倍。同一次求解中所有矩阵必须使用同一 dtype,
+    否则 scipy 会静默升型, 内存优势消失且行为难以预期。
+
+    默认值保持 float32, 以确保不改变既有行为。
+    """
+    raw = _os_smd.environ.get("PHEASY_SM_DTYPE", default).strip().lower()
+    if raw not in _SM_DTYPES:
+        raise ValueError(
+            "PHEASY_SM_DTYPE=%r 不合法, 可选: %s"
+            % (raw, ", ".join(sorted(set(_SM_DTYPES))))
+        )
+    return _SM_DTYPES[raw]
+
+
+def assert_uniform_dtype(**arrays):
+    """检查一组数组/矩阵的 dtype 是否一致, 不一致则抛错。
+
+    用法::
+
+        assert_uniform_dtype(X=X, y=y_in)
+    """
+    seen = {}
+    for name, obj in arrays.items():
+        dt = getattr(obj, "dtype", None)
+        if dt is not None:
+            seen[name] = _np_smd.dtype(dt).name
+    if len(set(seen.values())) > 1:
+        raise RuntimeError(
+            "线性系统 dtype 不一致: %s —— 可能有遗漏的 astype(np.float32) 硬编码" % seen
+        )
+    return seen

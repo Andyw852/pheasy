@@ -221,6 +221,20 @@ class SymmetryConstraints(object):
                 else:
                     cons_rasr = self.build_rotational_invariance(clusters[2])
                 cons_mat_dict[order].append(cons_rasr)
+                # [DUMP] 临时: 导出完整 RASR 约束矩阵供离线诊断
+                import os as _os_d
+                if _os_d.environ.get("PHEASY_DUMP_RASR", "0") == "1":
+                    import scipy.sparse as _spd, numpy as _npd
+                    _parts = []
+                    for _cm in cons_rasr:
+                        _a = _cm.toarray() if _spd.issparse(_cm) else _npd.asarray(_cm)
+                        _parts.append(_spd.csr_matrix(_a))
+                    _Cfull = _spd.vstack(_parts, format='csr')
+                    _spd.save_npz(_os_d.path.join(
+                        _os_d.environ.get("PHEASY_DUMP_DIR", "."),
+                        "cons_rasr_full.npz"), _Cfull)
+                    print("[DUMP] cons_rasr_full.npz saved, shape={}, {} blocks".format(
+                        _Cfull.shape, len(cons_rasr)), flush=True)
 
             """Construct whole null space matrix of each order."""
             logger.info("- Calculating null space.")
@@ -396,6 +410,38 @@ class SymmetryConstraints(object):
                     ns_mat = ns_mat.dot(ns_mat_tmp)
                     ns_mat = normalize(ns_mat, axis=0)
                 ns_mat = spmat.coo_matrix(ns_mat)
+            # [PATCH ns-rank] 丢弃数值上线性相关的列。
+            # 实测 ns_harm(1296x608) 有 8 个近零奇异值 (4 个 ~2.5e-10 + 4 个 ~1e-15),
+            # 与 0.63 之间隔着 2e9 倍谱隙 —— 608 个"自由度"只有 600 个独立。
+            # 成因: ASR 投影把落在约束行空间的列压成近零后, normalize(axis=0)
+            # 又把它们归一化成单位范数, 数值噪声被放大成"真列"。
+            # 后果: X = SM_prime @ NS 的条件数由 ~3e2 恶化到 ~1e7, 并继承同维零空间。
+            # 开关: PHEASY_NS_RANK_TOL (默认 1e-8, 设 0 关闭)
+            #       PHEASY_NS_RANK_MAXCOL (默认 5000, 超过则跳过以免稠密 SVD 爆内存)
+            import os as _os_nsr
+            _rank_tol = float(_os_nsr.environ.get("PHEASY_NS_RANK_TOL", "1e-8"))
+            _rank_maxcol = int(_os_nsr.environ.get("PHEASY_NS_RANK_MAXCOL", "5000"))
+            if _rank_tol > 0 and 1 < ns_mat.shape[1] <= _rank_maxcol:
+                _d = ns_mat.toarray() if spmat.issparse(ns_mat) else np.asarray(ns_mat)
+                _u, _sv, _vh = np.linalg.svd(_d, full_matrices=False)
+                _keep = int(np.sum(_sv > _sv[0] * _rank_tol))
+                if _keep < _d.shape[1]:
+                    logger.info(
+                        "- [ns-rank] order {}: dropped {} numerically dependent "
+                        "column(s), {} -> {}; sigma_min/sigma_max {:.3e} -> {:.3e}".format(
+                            order, _d.shape[1] - _keep, _d.shape[1], _keep,
+                            _sv[-1] / _sv[0], _sv[_keep - 1] / _sv[0]))
+                    ns_mat = spmat.coo_matrix(_d.dot(_vh[:_keep].T))
+                else:
+                    logger.info(
+                        "- [ns-rank] order {}: full column rank ({}), "
+                        "sigma_min/sigma_max = {:.3e}".format(
+                            order, _d.shape[1], _sv[-1] / _sv[0]))
+            elif _rank_tol > 0:
+                logger.info(
+                    "- [ns-rank] order {}: skipped (n_free={} > MAXCOL={})".format(
+                        order, ns_mat.shape[1], _rank_maxcol))
+
             ifc_free_order[order] = ns_mat.shape[1]
             null_space_list.append(ns_mat)
 
