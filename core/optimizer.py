@@ -178,34 +178,54 @@ def _solve_lstsq(A, y, driver="gelsd"):
 
 
 def _tsqr_qless(A, y, block_rows=40000, diag_floor=1e-12):
-    """[FIX P09] Q-less tall-skinny QR least squares, streamed by row blocks.
+    """[FIX P09/P24] Q-less tall-skinny QR least squares via a binary TREE.
 
-    Maintains only R (n x n) and z = Q^T y (n), never a full Q or a full copy
-    of A, so peak memory is O(n^2 + block_rows * n) instead of O(m * n).  This
-    is what "RFE-OLS-TSQR" advertises; the previous implementation just called
-    a plain dense ``scipy.linalg.qr`` on the whole matrix.
+    Level 0 QR-factors each row block independently, then the R factors are
+    paired and re-QR'd in a binary tree (log-depth).  This is the classic TSQR
+    of Demmel et al. and is numerically more stable than sequentially re-QRing
+    one growing [R; A_i] stack (the previous implementation), which lets
+    rounding error accumulate along the chain for ill-conditioned matrices.
+
+    Peak memory is O((m / block_rows + 1) * n^2 + block_rows * n): one R per
+    block at level 0, then a shrinking set of R's.  Never a full Q or a full
+    copy of A.
 
     Returns (coef, rank_ok, cond_estimate).
     """
     m, n = A.shape
     y64 = np.asarray(y, dtype=np.float64).ravel()
     block_rows = max(int(block_rows), n + 1)
-    R = None
-    z = None
+
+    # ---- level 0: independent QR of each block --------------------------------
+    Rs = []
+    zs = []
     for i0 in range(0, m, block_rows):
         i1 = min(i0 + block_rows, m)
         blk = A[i0:i1]
         blk = np.asarray(blk.toarray() if sp.issparse(blk) else blk, dtype=np.float64)
-        rhs = y64[i0:i1]
-        if R is None:
-            M, b = blk, rhs
-        else:
-            M = np.vstack([R, blk])
-            b = np.concatenate([z, rhs])
-        Qb, Rb = spla.qr(M, mode="economic", check_finite=False)
-        R = Rb
-        z = Qb.T @ b
-        del Qb, M, b
+        Q, Rb = spla.qr(blk, mode="economic", check_finite=False)
+        Rs.append(np.asarray(Rb, dtype=np.float64))
+        zs.append(np.asarray(Q.T @ y64[i0:i1], dtype=np.float64))
+        del Q, Rb, blk
+
+    # ---- binary-tree reduction of the R factors -------------------------------
+    while len(Rs) > 1:
+        nxt_R, nxt_z = [], []
+        for i in range(0, len(Rs), 2):
+            if i + 1 < len(Rs):
+                M = np.vstack([Rs[i], Rs[i + 1]])
+                b = np.concatenate([zs[i], zs[i + 1]])
+                Q, Rb = spla.qr(M, mode="economic", check_finite=False)
+                nxt_R.append(np.asarray(Rb, dtype=np.float64))
+                nxt_z.append(np.asarray(Q.T @ b, dtype=np.float64))
+                del Q, Rb, M, b
+            else:
+                nxt_R.append(Rs[i])
+                nxt_z.append(zs[i])
+        Rs, zs = nxt_R, nxt_z
+
+    R = Rs[0]
+    z = zs[0]
     diag = np.abs(np.diag(R))
     dmax = float(diag.max()) if diag.size else 0.0
     dmin = float(diag.min()) if diag.size else 0.0
@@ -404,7 +424,7 @@ class TwoLevelSM(LinearOperator):
 
 
 
-def _reselect_alpha(model, A, y):
+def _reselect_alpha(model, A, y, sample_weight=None):
     """[FIX P10] Re-pick alpha from the CV path and refit if it changed.
 
     Two problems with sklearn's plain ``argmin`` here:
@@ -450,7 +470,7 @@ def _reselect_alpha(model, A, y):
                  max_iter=model.max_iter, tol=model.tol,
                  selection=getattr(model, "selection", "cyclic"),
                  random_state=getattr(model, "random_state", None))
-    est.fit(A, y)
+    est.fit(A, y, sample_weight=sample_weight)  # [FIX] keep sample_weight in the refit
     model.alpha_ = new_alpha
     model.coef_ = est.coef_
     model.intercept_ = est.intercept_
@@ -498,7 +518,7 @@ class _LassoCVModel:
         )
         model.fit(A, y, sample_weight=sample_weight)
         self.model_ = model
-        _reselect_alpha(model, A, y)      # [FIX P10]
+        _reselect_alpha(model, A, y, sample_weight=sample_weight)  # [FIX P10]
         self.coef_ = model.coef_
         self.intercept_ = model.intercept_
         self.alpha_ = model.alpha_
@@ -554,8 +574,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
             n_jobs=self.n_jobs,
         )
         model.fit(A_scaled, y, sample_weight=sample_weight)
-        _reselect_alpha(model, A_scaled, y)   # [FIX P23] apply the tie-break/1-SE
-                                              # alpha reselection to ALASSO too
+        _reselect_alpha(model, A_scaled, y, sample_weight=sample_weight)  # [FIX P23]
         self.model_ = model
         self.coef_ = model.coef_ / self._weights
         self.intercept_ = model.intercept_ if self.fit_intercept else 0.0
@@ -986,10 +1005,14 @@ class Optimizer(object):
         return self
 
     def _fit_ols(self, A, F):
-        if sp.issparse(A) or _is_linear_operator(A):
+        if _is_linear_operator(A):
+            # LSMR only needs matvec/rmatvec; the two-level operator stays sparse.
             coef = self._ols_lsmr(A, F)
             n_iter = self._ols_lsmr_info.get("itn")
             return coef, n_iter
+        # dense, or a sparse container: _solve_lstsq densifies small/sparse-but-
+        # dense matrices (fast SVD) and only uses iterative LSQR for genuinely
+        # huge sparse matrices (FIX: previously everything sparse went to LSMR).
         coef = _solve_lstsq(A, F, driver="gelsd")
         return coef, None
 
