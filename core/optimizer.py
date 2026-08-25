@@ -330,6 +330,10 @@ class _RFECVBase:
 
     def fit(self, A, y, sample_weight=None):
         y = np.asarray(y, dtype=np.float64).ravel()
+        if _is_linear_operator(A):
+            # RFE needs explicit column slicing (A[:, idx]); a LinearOperator
+            # (e.g. TwoLevelSM) has no __getitem__, so materialize it once.
+            A = _to_dense_f64(A)
         n_samples, n_features = A.shape
         self.n_features_in_ = n_features
 
@@ -338,16 +342,20 @@ class _RFECVBase:
         splits = _make_cv_splits(n_samples, self.cv, self.random_state,
                                  self._cv_group_size(n_samples))
 
+        patience = int(os.environ.get("PHEASY_RFE_PATIENCE", "5"))
         active = np.ones(n_features, dtype=bool)
         history = []  # (n_active, cv_mean, cv_se, support)
 
         if self.verbose:
             print(f"[RFE] START n_features={n_features}, step={self.step:.2f}, "
                   f"cv={self.cv}, min_features={self.min_features}, "
+                  f"patience={patience}, "
                   f"solver={self._solver_name}, ridge_alpha={self.ridge_alpha:.2e}",
                   flush=True)
 
         round_num = 0
+        best_cv = float("inf")
+        no_improve = 0
         while True:
             idx = np.where(active)[0]
             n_active = len(idx)
@@ -363,6 +371,18 @@ class _RFECVBase:
                       f"CV_RMSE={cv_mean:.6e} (+-{cv_se:.2e})  "
                       f"nonzero={int(np.count_nonzero(coef_active))}", flush=True)
 
+            # early stop once CV has stopped improving for `patience` rounds;
+            # further elimination can only degrade the 1-SE-selected model.
+            if cv_mean < best_cv:
+                best_cv = cv_mean
+                no_improve = 0
+            else:
+                no_improve += 1
+            if no_improve >= patience:
+                if self.verbose:
+                    print(f"[RFE] CV 连续 {patience} 轮无改善, 提前停止.", flush=True)
+                break
+
             if n_active <= self.min_features:
                 break
 
@@ -373,10 +393,15 @@ class _RFECVBase:
             active[idx[remove_local]] = False
             round_num += 1
 
-        n_best, best_mean, best_se, best_support = _select_1se(history)
+        if not history:
+            # min_features >= n_features: nothing was eliminated, keep all.
+            n_best, best_mean, best_se = n_features, 0.0, 0.0
+            best_support = np.ones(n_features, dtype=bool)
+        else:
+            n_best, best_mean, best_se, best_support = _select_1se(history)
         best_idx = np.where(best_support)[0]
 
-        if self.verbose:
+        if self.verbose and history:
             argmin = history[int(np.argmin([h[1] for h in history]))]
             print(f"[RFE] argmin: n_active={argmin[0]}, CV={argmin[1]:.6e}", flush=True)
             print(f"[RFE] selected: n_active={n_best}, CV={best_mean:.6e} "
