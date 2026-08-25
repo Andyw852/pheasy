@@ -115,15 +115,21 @@ def derive_alpha_grid(A, y, nalpha=100, decades=4.0, standardize=False,
 def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
     """Return a list of (train_idx, val_idx) index arrays."""
     if cv is None or cv <= 1:
-        kf = KFold(n_splits=min(3, n_samples), shuffle=True, random_state=random_state)
-        return list(kf.split(np.arange(n_samples)))
+        cv = min(3, n_samples)
+    cv = int(cv)
     if group_size and group_size > 1 and n_samples % group_size == 0:
         groups = np.arange(n_samples) // group_size
         n_groups = int(groups[-1]) + 1
-        if n_groups >= cv:
-            gkf = GroupKFold(n_splits=cv)
+        if n_groups >= 2:
+            # Clamp cv to the number of configurations. A row-based KFold here
+            # would leak rows of the same configuration across train/val folds,
+            # silently biasing the CV estimate (FIX P23).
+            eff_cv = int(min(cv, n_groups))
+            gkf = GroupKFold(n_splits=eff_cv)
             return list(gkf.split(np.zeros(n_samples, dtype=np.int8),
                                   np.zeros(n_samples, dtype=np.int8), groups))
+    # no group info (or a single configuration): fall back to row-based KFold
+    cv = max(2, min(cv, n_samples))
     kf = KFold(n_splits=cv, shuffle=True, random_state=random_state)
     return list(kf.split(np.arange(n_samples)))
 
@@ -171,17 +177,65 @@ def _solve_lstsq(A, y, driver="gelsd"):
     return np.asarray(coef, dtype=np.float64)
 
 
-def _solve_qr(A, y):
+def _tsqr_qless(A, y, block_rows=40000, diag_floor=1e-12):
+    """[FIX P09] Q-less tall-skinny QR least squares, streamed by row blocks.
+
+    Maintains only R (n x n) and z = Q^T y (n), never a full Q or a full copy
+    of A, so peak memory is O(n^2 + block_rows * n) instead of O(m * n).  This
+    is what "RFE-OLS-TSQR" advertises; the previous implementation just called
+    a plain dense ``scipy.linalg.qr`` on the whole matrix.
+
+    Returns (coef, rank_ok, cond_estimate).
+    """
+    m, n = A.shape
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    block_rows = max(int(block_rows), n + 1)
+    R = None
+    z = None
+    for i0 in range(0, m, block_rows):
+        i1 = min(i0 + block_rows, m)
+        blk = A[i0:i1]
+        blk = np.asarray(blk.toarray() if sp.issparse(blk) else blk, dtype=np.float64)
+        rhs = y64[i0:i1]
+        if R is None:
+            M, b = blk, rhs
+        else:
+            M = np.vstack([R, blk])
+            b = np.concatenate([z, rhs])
+        Qb, Rb = spla.qr(M, mode="economic", check_finite=False)
+        R = Rb
+        z = Qb.T @ b
+        del Qb, M, b
+    diag = np.abs(np.diag(R))
+    dmax = float(diag.max()) if diag.size else 0.0
+    dmin = float(diag.min()) if diag.size else 0.0
+    cond = (dmax / dmin) if dmin > 0 else np.inf
+    if dmax == 0.0 or dmin <= diag_floor * max(dmax, 1.0):
+        return None, False, cond
+    coef = spla.solve_triangular(R, z, lower=False, check_finite=False)
+    return np.asarray(coef, dtype=np.float64), True, cond
+
+
+def _solve_qr(A, y, block_rows=None, diag_floor=1e-12):
     """OLS via tall-skinny QR (Householder QR + triangular solve).
 
     Numerically stable for full-column-rank matrices. Sparse / LinearOperator
     input falls back to LSQR (scipy has no sparse QR least-squares driver; LSQR
     is a Golub-Kahan bidiagonalization, QR-like, and memory efficient).
+
+    [FIX P09] ``block_rows`` now actually streams the factorization instead of
+    being an ignored constructor argument; ``diag_floor`` guards the triangular
+    solve against a rank-deficient R.
     """
     if _is_linear_operator(A):
         return _solve_sparse_lsqr(A, y)
     if sp.issparse(A) and not _should_densify_sparse(A):
         return _solve_sparse_lsqr(A, y)
+    if block_rows and A.shape[0] > int(block_rows):
+        coef, ok, _cond = _tsqr_qless(A, y, block_rows, diag_floor)
+        if ok:
+            return coef
+        return _solve_lstsq(A, y)     # rank deficient -> SVD
     A64 = _to_dense_f64(A)
     y64 = np.asarray(y, dtype=np.float64).ravel()
     Q, R = spla.qr(A64, mode="economic", check_finite=False)
@@ -228,8 +282,14 @@ def _make_masked_op(A, row_idx, col_idx):
     return LinearOperator((n_rows, n_cols), matvec=mv, rmatvec=rmv, dtype=dt)
 
 
-def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False):
-    """Solve min ||A[row_idx][:, col_idx] x - y[row_idx]||^2 (+ optional ridge)."""
+def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
+                  lsmr_atol=None, lsmr_btol=None, lsmr_maxiter=None,
+                  block_rows=None, diag_floor=1e-12):
+    """Solve min ||A[row_idx][:, col_idx] x - y[row_idx]||^2 (+ optional ridge).
+
+    [FIX P09] the lsmr_* / block_rows / diag_floor knobs are threaded through
+    from the estimator instead of being silently dropped on the floor.
+    """
     y_sub = np.asarray(y, dtype=np.float64).ravel()
     if row_idx is not None:
         y_sub = y_sub[row_idx]
@@ -237,9 +297,12 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False):
         # LSMR on a masked operator: no materialization, memory ~O(n_features).
         op = _make_masked_op(A, row_idx, col_idx)
         n = len(col_idx)
-        atol = float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8"))
-        btol = float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8"))
-        maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
+        atol = float(os.environ.get("PHEASY_LSQR_ATOL", str(
+            lsmr_atol if lsmr_atol is not None else 1e-8)))
+        btol = float(os.environ.get("PHEASY_LSQR_BTOL", str(
+            lsmr_btol if lsmr_btol is not None else 1e-8)))
+        maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", str(
+            lsmr_maxiter if lsmr_maxiter is not None else 5000)))
         if ridge_alpha > 0:
             sqrt_a = float(np.sqrt(ridge_alpha))
 
@@ -266,7 +329,8 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False):
         ridge.fit(A_sub, y_sub)
         return ridge.coef_
     if qr:
-        return _solve_qr(A_sub, y_sub)
+        return _solve_qr(A_sub, y_sub, block_rows=block_rows,
+                         diag_floor=diag_floor)
     return _solve_lstsq(A_sub, y_sub)
 
 
@@ -339,6 +403,60 @@ class TwoLevelSM(LinearOperator):
         return _to_dense_f64(self)
 
 
+
+def _reselect_alpha(model, A, y):
+    """[FIX P10] Re-pick alpha from the CV path and refit if it changed.
+
+    Two problems with sklearn's plain ``argmin`` here:
+
+    1. When coordinate descent stops early (a loose ``--tol`` is scaled by
+       ``||y||^2``, so 1e-3 is very loose), the low-alpha end of the path
+       returns literally the same solution and the CV curve goes flat.  Since
+       ``alphas_`` is sorted descending, ``argmin`` then picks the *most*
+       regularized member of the tie -- which is how LASSO ends up with force
+       constants ~10% too small.  Ties are now broken toward the smallest alpha
+       and a warning is printed, because a flat tail means "not converged".
+    2. ``PHEASY_LASSO_1SE=1`` optionally applies the one-standard-error rule
+       (largest alpha within 1 SE of the best), matching what RFE already does.
+    """
+    alphas = np.asarray(model.alphas_, dtype=np.float64)
+    mse = np.asarray(model.mse_path_, dtype=np.float64)
+    if alphas.size < 2 or mse.ndim != 2:
+        return
+    mean = mse.mean(axis=1)
+    best = float(mean.min())
+    rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
+    tied = np.flatnonzero(mean <= best * (1.0 + rtol) + 1e-300)
+    if os.environ.get("PHEASY_LASSO_1SE", "0").lower() in ("1", "true", "yes"):
+        k = int(np.argmin(mean))
+        se = float(mse[k].std(ddof=1) / np.sqrt(mse.shape[1])) if mse.shape[1] > 1 else 0.0
+        cand = np.flatnonzero(mean <= best + se)
+        new_alpha = float(alphas[cand].max())
+    else:
+        new_alpha = float(alphas[tied].min())
+    if tied.size > 1:
+        print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). The "
+              "coordinate descent almost certainly stopped on max_iter/tol "
+              "rather than converging -- lower --tol (1e-6) and/or raise "
+              "--max_iter, otherwise the fit is over-regularized."
+              % (tied.size, best, float(alphas[tied].min()),
+                 float(alphas[tied].max())), flush=True)
+    if new_alpha == float(model.alpha_):
+        return
+    print("[CV] alpha reselected: %.6e -> %.6e" % (float(model.alpha_), new_alpha),
+          flush=True)
+    from sklearn.linear_model import Lasso as _Lasso
+    est = _Lasso(alpha=new_alpha, fit_intercept=model.fit_intercept,
+                 max_iter=model.max_iter, tol=model.tol,
+                 selection=getattr(model, "selection", "cyclic"),
+                 random_state=getattr(model, "random_state", None))
+    est.fit(A, y)
+    model.alpha_ = new_alpha
+    model.coef_ = est.coef_
+    model.intercept_ = est.intercept_
+    model.n_iter_ = int(np.max(np.atleast_1d(est.n_iter_)))
+
+
 class _OLSModel:
     def __init__(self, coef, n_iter=None):
         self.coef_ = np.asarray(coef)
@@ -380,6 +498,7 @@ class _LassoCVModel:
         )
         model.fit(A, y, sample_weight=sample_weight)
         self.model_ = model
+        _reselect_alpha(model, A, y)      # [FIX P10]
         self.coef_ = model.coef_
         self.intercept_ = model.intercept_
         self.alpha_ = model.alpha_
@@ -435,6 +554,8 @@ class _AdaptiveLassoCV(_LassoCVModel):
             n_jobs=self.n_jobs,
         )
         model.fit(A_scaled, y, sample_weight=sample_weight)
+        _reselect_alpha(model, A_scaled, y)   # [FIX P23] apply the tie-break/1-SE
+                                              # alpha reselection to ALASSO too
         self.model_ = model
         self.coef_ = model.coef_ / self._weights
         self.intercept_ = model.intercept_ if self.fit_intercept else 0.0
@@ -453,10 +574,30 @@ class _AdaptiveLassoCV(_LassoCVModel):
 
 
 def _scale_columns(A, w):
-    """Column-scaled copy of A: A[:, j] / w[j] (dense or sparse)."""
+    """Column-scaled copy of A: A[:, j] / w[j] (dense or sparse).
+
+    [FIX P07] A LinearOperator (e.g. TwoLevelSM) has no columns to scale, so it
+    must be materialized -- sklearn's coordinate descent cannot consume an
+    operator anyway.  The old code did that silently via ``A @ np.eye(n)``,
+    which quietly undoes the whole two-level memory optimization and OOM-kills
+    the job on large cutoffs.  Now we say so, and refuse above a budget.
+    """
     inv_w = 1.0 / np.asarray(w, dtype=np.float64)
     if sp.issparse(A):
         return A.astype(np.float64).multiply(inv_w[None, :]).tocsr()
+    if _is_linear_operator(A):
+        need = float(A.shape[0]) * float(A.shape[1]) * 8.0
+        budget = float(os.environ.get("PHEASY_MAX_DENSE_GB", "16")) * 1e9
+        msg = ("--std / LASSO / ALASSO / RIDGE need a materialized design "
+               "matrix, so the two-level operator %s must be densified "
+               "(%.1f GB in float64)." % (str(A.shape), need / 1e9))
+        if need > budget:
+            raise MemoryError(
+                msg + " That exceeds PHEASY_MAX_DENSE_GB=%.1f GB. Use -l OLS or "
+                "-l RFE (which stream the operator), drop --std, or raise "
+                "PHEASY_MAX_DENSE_GB if you really have the RAM."
+                % (budget / 1e9))
+        print("[optimizer] WARNING: " + msg, flush=True)
     A64 = _to_dense_f64(A)
     # A[:, j] * (1/w[j]) == A[:, j] / w[j]
     return A64 * inv_w[None, :]
@@ -471,7 +612,9 @@ class _RFECVBase:
     """
 
     def __init__(self, step=0.1, cv=5, min_features=1, n_jobs=-1,
-                 verbose=False, random_state=None, solver="lstsq", ridge_alpha=0.0):
+                 verbose=False, random_state=None, solver="lstsq", ridge_alpha=0.0,
+                 patience=5, lsmr_maxiter=5000, lsmr_atol=1e-8, lsmr_btol=1e-8,
+                 block_rows=None, diag_floor=1e-12):
         self.step = float(step)
         self.cv = int(cv)
         self.min_features = int(min_features)
@@ -480,6 +623,13 @@ class _RFECVBase:
         self.random_state = random_state
         self.ridge_alpha = float(ridge_alpha)
         self._solver_name = solver
+        # [FIX P09] previously accepted-and-ignored constructor arguments
+        self.patience = int(patience)
+        self.lsmr_maxiter = int(lsmr_maxiter)
+        self.lsmr_atol = float(lsmr_atol)
+        self.lsmr_btol = float(lsmr_btol)
+        self.block_rows = None if block_rows is None else int(block_rows)
+        self.diag_floor = float(diag_floor)
 
     def _cv_group_size(self, n_samples):
         gs = int(os.environ.get("PHEASY_CV_GROUP_SIZE", "0"))
@@ -497,12 +647,18 @@ class _RFECVBase:
 
         def solve(col_idx, row_idx=None):
             return _solve_subset(A, y, row_idx, col_idx,
-                                 self.ridge_alpha, _qr)
+                                 self.ridge_alpha, _qr,
+                                 lsmr_atol=self.lsmr_atol,
+                                 lsmr_btol=self.lsmr_btol,
+                                 lsmr_maxiter=self.lsmr_maxiter,
+                                 block_rows=self.block_rows,
+                                 diag_floor=self.diag_floor)
 
         splits = _make_cv_splits(n_samples, self.cv, self.random_state,
                                  self._cv_group_size(n_samples))
 
-        patience = int(os.environ.get("PHEASY_RFE_PATIENCE", "5"))
+        # [FIX P09] constructor value is the default; env var is an override
+        patience = int(os.environ.get("PHEASY_RFE_PATIENCE", str(self.patience)))
         active = np.ones(n_features, dtype=bool)
         history = []  # (n_active, cv_mean, cv_se, support)
 
@@ -588,23 +744,35 @@ class _RFECVBase:
 class PheasyRFECV(_RFECVBase):
     """RFE with an OLS (optionally ridge-regularized) base estimator."""
 
-    def __init__(self, step=0.1, cv=5, ridge_alpha=0.0, lsmr_maxiter=3000,
+    def __init__(self, step=0.05, cv=5, ridge_alpha=0.0, lsmr_maxiter=3000,   # [FIX P21]
                  lsmr_atol=1e-8, lsmr_btol=1e-8, n_jobs=-1, min_features=1,
-                 verbose=True, random_state=None):
+                 verbose=True, random_state=None, patience=5):
+        # [FIX P09] lsmr_* used to be dropped here
         super().__init__(step=step, cv=cv, min_features=min_features, n_jobs=n_jobs,
                          verbose=verbose, random_state=random_state,
-                         solver="lstsq", ridge_alpha=ridge_alpha)
+                         solver="lstsq", ridge_alpha=ridge_alpha,
+                         patience=patience, lsmr_maxiter=lsmr_maxiter,
+                         lsmr_atol=lsmr_atol, lsmr_btol=lsmr_btol)
 
 
 class PheasyRFE_OLS_TSQR(_RFECVBase):
-    """RFE with a strict OLS base estimator solved via QR (TSQR-flavored)."""
+    """RFE with a strict OLS base estimator solved by Q-less tall-skinny QR.
+
+    [FIX P09] ``patience``, ``block_rows`` and ``diag_floor`` are now honoured:
+    the base solve streams the factorization block by block (see
+    ``_tsqr_qless``) instead of running a plain dense QR on the whole matrix.
+    The former ``recalibrate`` argument is gone: it never had an effect, and
+    the base estimator re-solves exactly every round, so there is nothing to
+    recalibrate.
+    """
 
     def __init__(self, step=0.05, patience=5, min_features=100, block_rows=40000,
-                 recalibrate=4, diag_floor=1e-12, cv=5, verbose=True,
+                 diag_floor=1e-12, cv=5, verbose=True,
                  random_state=None, n_jobs=-1):
         super().__init__(step=step, cv=cv, min_features=min_features, n_jobs=n_jobs,
                          verbose=verbose, random_state=random_state,
-                         solver="qr", ridge_alpha=0.0)
+                         solver="qr", ridge_alpha=0.0, patience=patience,
+                         block_rows=block_rows, diag_floor=diag_floor)
 
 
 # backward-compatible aliases
@@ -717,19 +885,30 @@ class Optimizer(object):
             coef = self._model.coef_
         elif method == "RFE":
             self._model = PheasyRFECV(
-                step=float(os.environ.get("PHEASY_RFE_STEP", "0.1")),
+                step=float(os.environ.get("PHEASY_RFE_STEP", "0.05")),  # [FIX P21]
                 cv=self._cv,
                 ridge_alpha=float(os.environ.get("PHEASY_RFE_RIDGE_ALPHA", "0")),
                 n_jobs=int(os.environ.get("PHEASY_N_JOBS", "-1")),
                 min_features=int(os.environ.get("PHEASY_RFE_MIN_FEATURES", "1")),
+                patience=int(os.environ.get("PHEASY_RFE_PATIENCE", "5")),
+                lsmr_maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")),
+                lsmr_atol=float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8")),
+                lsmr_btol=float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8")),
                 verbose=True, random_state=self._rand_seed)
             self._model.fit(A, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "RFE-OLS-TSQR":
+            # [FIX P13] default matches the class default (100), not 1
             self._model = PheasyRFE_OLS_TSQR(
-                step=float(os.environ.get("PHEASY_TSQR_STEP", "0.05")),
+                # [FIX P21] PHEASY_TSQR_STEP overrides, else PHEASY_RFE_STEP
+                step=float(os.environ.get(
+                    "PHEASY_TSQR_STEP",
+                    os.environ.get("PHEASY_RFE_STEP", "0.05"))),
                 cv=self._cv,
-                min_features=int(os.environ.get("PHEASY_TSQR_MIN_FEATURES", "1")),
+                min_features=int(os.environ.get("PHEASY_TSQR_MIN_FEATURES", "100")),
+                block_rows=int(os.environ.get("PHEASY_TSQR_BLOCK_ROWS", "40000")),
+                diag_floor=float(os.environ.get("PHEASY_TSQR_DIAG_FLOOR", "1e-12")),
+                patience=int(os.environ.get("PHEASY_RFE_PATIENCE", "5")),
                 verbose=True, random_state=self._rand_seed)
             self._model.fit(A, F64, sample_weight=weights)
             coef = self._model.coef_
@@ -756,7 +935,14 @@ class Optimizer(object):
         if col_scale is not None:
             coef = coef / col_scale
 
-        self._results["coef"] = np.where(np.abs(coef) < 1e-12, 0.0, coef)
+        # [FIX P11] the hard threshold used to hit every method, including OLS
+        # and RFE, where zeroing tiny-but-real coefficients is not wanted.
+        # Default: only the L1 methods (whose exact zeros are the point).
+        _default_tol = "1e-12" if method in ("LASSO", "ALASSO") else "0"
+        _zero_tol = float(os.environ.get("PHEASY_COEF_ZERO_TOL", _default_tol))
+        if _zero_tol > 0:
+            coef = np.where(np.abs(coef) < _zero_tol, 0.0, coef)
+        self._results["coef"] = coef
         self._model.coef_ = self._results["coef"]
 
         if method in ("LASSO", "ALASSO"):
@@ -767,7 +953,8 @@ class Optimizer(object):
             self._metrics["mse_path_mean"] = float(np.mean(self._metrics["mse_path"]))
             self._metrics["rmse_path"] = np.sqrt(self._metrics["mse_path"])
             self._metrics["rmse_path_mean"] = float(np.mean(self._metrics["rmse_path"]))
-            self._metrics["n_featrues"] = self._model.n_features_in_
+            self._metrics["n_features"] = self._model.n_features_in_
+            self._metrics["n_featrues"] = self._metrics["n_features"]  # [FIX P12] deprecated alias
         elif method in ("RFE", "RFE-OLS-TSQR"):
             self._results["alpha"] = float(getattr(self._model, "ridge_alpha", 0.0))
             self._results["n_iter"] = int(getattr(self._model, "n_iter_", 0))
@@ -776,7 +963,8 @@ class Optimizer(object):
             self._metrics["mse_path_mean"] = bcv ** 2
             self._metrics["rmse_path"] = np.array([bcv])
             self._metrics["rmse_path_mean"] = bcv
-            self._metrics["n_featrues"] = self._model.n_features_in_
+            self._metrics["n_features"] = self._model.n_features_in_
+            self._metrics["n_featrues"] = self._metrics["n_features"]  # [FIX P12] deprecated alias
         elif method == "RIDGE":
             self._results["alpha"] = float(self._model.alpha_)
         elif method == "OLS":
@@ -815,7 +1003,14 @@ class Optimizer(object):
         if not (0 < sup.size < coef.size):
             return coef
         if _is_linear_operator(A):
-            # no cheap column slicing for a LinearOperator; skip debias safely
+            # [FIX P08] no cheap column slicing for a LinearOperator. Skipping
+            # debias silently is dangerous: the L1 shrinkage bias is exactly
+            # what makes LASSO force constants come out ~10% too small.
+            print("[optimizer] WARNING: LASSO debias skipped -- the design "
+                  "matrix is a LinearOperator and cannot be column-sliced. "
+                  "The returned force constants still carry the L1 shrinkage "
+                  "bias. Set PHEASY_OLS_TWOLEVEL=0 / PHEASY_LASSO_SPARSE=0 to "
+                  "get a sliceable matrix.", flush=True)
             return coef
         A_sub = A[:, sup]
         coef_sub = _solve_lstsq(A_sub, y)

@@ -4,3 +4,7 @@ __pycache__/
 # local verification data and download staging
 MnIn2Se4_lasso/
 .staging/
+
+# c3=7.0 扫描数据 (大文件, 不入库)
+MnIn2Se4_c7/
+*.egg-info/
