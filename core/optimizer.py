@@ -64,6 +64,54 @@ def _col_norms(A):
     return norms
 
 
+def derive_alpha_grid(A, y, nalpha=100, decades=4.0, standardize=False,
+                     mu_shift=0.0):
+    """Derive a LASSO/ALASSO alpha grid from the data.
+
+    alpha_max = max_j |X_j^T y| / n  is the smallest alpha for which the LASSO
+    solution is all zeros (the KKT threshold, matching sklearn's convention).
+    The grid spans ``[alpha_max * 10**-decades, alpha_max]``.  When
+    ``standardize`` is True the columns are first scaled to unit L2 norm (the
+    same scaling the Optimizer applies), so the returned grid lives in the
+    standardized space.
+
+    Memory efficient: chunked accumulation for dense (mmap-friendly) input,
+    sparse matvec for sparse / LinearOperator input.
+
+    Returns a float64 array of alpha VALUES.
+    """
+    n = A.shape[0]
+    p = A.shape[1]
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    g = np.zeros(p, dtype=np.float64)
+
+    if sp.issparse(A) or _is_linear_operator(A):
+        g = np.asarray(A.T @ y64).ravel().astype(np.float64)
+        if standardize:
+            cn = _col_norms(A)
+            cn = np.where(cn < 1e-30, 1.0, cn)
+            g = g / cn
+    else:
+        s2 = np.zeros(p, dtype=np.float64)
+        blk = max(1, int(2e8 // max(p, 1)))
+        for i0 in range(0, n, blk):
+            B = np.asarray(A[i0:i0 + blk], dtype=np.float64)
+            g += B.T @ y64[i0:i0 + B.shape[0]]
+            if standardize:
+                s2 += (B * B).sum(axis=0)
+        if standardize:
+            cn = np.sqrt(s2)
+            cn = np.where(cn < 1e-30, 1.0, cn)
+            g = g / cn
+
+    a_max = float(np.abs(g).max()) / n
+    a_max *= 10.0 ** float(mu_shift)
+    if not np.isfinite(a_max) or a_max <= 0:
+        raise ValueError("alpha_max = %r, invalid" % a_max)
+    a_min = a_max * 10.0 ** (-float(decades))
+    return np.logspace(np.log10(a_min), np.log10(a_max), nalpha)
+
+
 def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
     """Return a list of (train_idx, val_idx) index arrays."""
     if cv is None or cv <= 1:

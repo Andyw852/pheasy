@@ -995,6 +995,29 @@ class WorkFlow(object):
                 settings.MODEL = "RFE"
                 print("[run_pheasy] PHEASY_USE_RFE=1 detected, "
                       "switching LASSO -> RFE", flush=True)
+            # Auto-derive the LASSO/ALASSO alpha grid from the data (default),
+            # so the shell script no longer needs the derive_alpha_grid logic.
+            alpha_kwargs = {}
+            if settings.MODEL.upper() in ("LASSO", "ALASSO") and settings.ALPHA_AUTO:
+                try:
+                    from pheasy.core.optimizer import derive_alpha_grid as _derive_alpha
+                    _shift = 0.0
+                    if settings.MODEL.upper() == "ALASSO":
+                        # adaptive weights enlarge the effective penalty; shift the
+                        # grid down so the CV optimum is not pushed to the low edge.
+                        _shift = float(os.environ.get("PHEASY_ALASSO_MU_SHIFT", "-2"))
+                    _grid = _derive_alpha(
+                        SM, FM, nalpha=settings.NALPHA,
+                        decades=float(os.environ.get("PHEASY_ALPHA_DECADES",
+                                                     str(settings.ALPHA_DECADES))),
+                        standardize=settings.STANDARDIZE, mu_shift=_shift)
+                    alpha_kwargs["alpha"] = _grid
+                    logger.info("- alpha_auto: grid [%.3e, %.3e] (%d alphas)"
+                                % (_grid[0], _grid[-1], len(_grid)))
+                except Exception as _e:
+                    logger.warning(
+                        "alpha_auto derivation failed (%s); falling back to manual "
+                        "--mu_min/--mu_max grid.", _e)
             optimizer = Optimizer(
                 settings.MODEL,
                 nalpha=settings.NALPHA,
@@ -1005,6 +1028,7 @@ class WorkFlow(object):
                 max_iter=settings.MAX_ITER,
                 rand_seed=settings.RAND_SEED,
                 standardize=settings.STANDARDIZE,
+                **alpha_kwargs,
             )
             if settings.MODEL.upper() == "LASSO":
                 logger.info("Fitting force constants via the coordinate descent LASSO.")
@@ -1031,6 +1055,27 @@ class WorkFlow(object):
             optimizer.fit(SM, FM)
             fit_results = optimizer.results
             fit_metrics = optimizer.metrics
+
+            # warn when alpha_opt sits at a grid edge (the CV wanted a value
+            # outside the grid); this replaces the old shell retry loop.
+            if settings.MODEL.upper() in ("LASSO", "ALASSO") and "alpha" in fit_results:
+                _grid = np.asarray(optimizer._alpha)
+                _aopt = float(fit_results["alpha"])
+                if _grid.size > 1 and _aopt > 0:
+                    _lg_lo = float(np.log10(_grid[0]))
+                    _lg_hi = float(np.log10(_grid[-1]))
+                    _lg_a = float(np.log10(_aopt))
+                    _span = max(_lg_hi - _lg_lo, 1e-12)
+                    if _lg_a <= _lg_lo + 0.05 * _span:
+                        logger.warning(
+                            "alpha_opt %.3e sits at the LOW edge of the grid — "
+                            "the data may be overdetermined; consider OLS or a "
+                            "lower grid.", _aopt)
+                    elif _lg_a >= _lg_hi - 0.05 * _span:
+                        logger.warning(
+                            "alpha_opt %.3e sits at the HIGH edge of the grid — "
+                            "consider a higher grid.", _aopt)
+
             FC_model.set_force_constant_metrics(fit_metrics)
 
             logger.info("Summary of force constants fitting:")
@@ -1039,8 +1084,10 @@ class WorkFlow(object):
                     "- Reaching the specified tolerance for the optimal "
                     + "alpha after {} iterations.".format(fit_results["n_iter"])
                 )
-                logger.info("- alpha_min: 1e{}".format(settings.ALPHA_MIN))
-                logger.info("- alpha_max: 1e{}".format(settings.ALPHA_MAX))
+                _used_alpha = np.asarray(optimizer._alpha)
+                if _used_alpha.size:
+                    logger.info("- alpha_min: {:.3e}".format(float(_used_alpha[0])))
+                    logger.info("- alpha_max: {:.3e}".format(float(_used_alpha[-1])))
                 logger.info("- alpha_opt: {}".format(fit_results["alpha"]))
                 logger.info("- RMSE_CV: {} eV/A".format(fit_metrics["rmse_path_mean"]))
             elif settings.MODEL.upper() == "RFE":

@@ -564,6 +564,26 @@ class InputParser(argparse.ArgumentParser):
                     alpha.""",
         )
         self.add_argument(
+            "--alpha_auto",
+            dest="ALPHA_AUTO",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="""Only valid when MODEL is LASSO or ALASSO. When enabled
+                    (default), the alpha grid is derived from the data:
+                    alpha_max = max_j |X_j^T y| / n, grid spans
+                    [alpha_max * 10^-ALPHA_DECADES, alpha_max]. Disable to use
+                    the manual --mu_min/--mu_max grid.""",
+        )
+        self.add_argument(
+            "--alpha_decades",
+            dest="ALPHA_DECADES",
+            action="store",
+            default=4.0,
+            type=float,
+            help="""Only valid when ALPHA_AUTO is enabled. Number of orders of
+                    magnitude the auto alpha grid spans below alpha_max.""",
+        )
+        self.add_argument(
             "--mu_min",
             "--alpha_min",
             dest="ALPHA_MIN",
