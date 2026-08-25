@@ -51,6 +51,46 @@ except ImportError:
     from pheasy.core.utilities import get_sm_dtype as _sm_dtype
 
 
+
+def _cap_n_jobs_by_memory(n_jobs, cs_full):
+    """[FIX P04] Cap joblib workers so the pickled cluster space fits in RAM.
+
+    Each worker receives its own copy of ``cs_full``; on a memory-tight node
+    that silently triggers the OOM killer and joblib reports nothing useful.
+    Override the safety margin with ``PHEASY_SM_MEM_FRACTION`` (default 0.6)
+    or bypass entirely with ``PHEASY_N_JOBS_NO_CAP=1``.
+    """
+    import os as _os
+    import pickle as _pk
+
+    if n_jobs in (0, 1):
+        return 1
+    if _os.environ.get("PHEASY_N_JOBS_NO_CAP", "").lower() in ("1", "true", "yes"):
+        return n_jobs
+    try:
+        avail = _os.sysconf("SC_AVPHYS_PAGES") * _os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return n_jobs
+    try:
+        per_worker = len(_pk.dumps(cs_full, protocol=_pk.HIGHEST_PROTOCOL))
+    except Exception:
+        return n_jobs
+    if per_worker <= 0:
+        return n_jobs
+    frac = float(_os.environ.get("PHEASY_SM_MEM_FRACTION", "0.6"))
+    # x3: pickle buffer in the parent + unpickled object in the child + slack
+    budget = max(1, int(avail * frac / (per_worker * 3.0)))
+    n_cpu = _os.cpu_count() or 1
+    capped = max(1, min(n_jobs if n_jobs > 0 else n_cpu, budget, n_cpu))
+    if capped < n_jobs:
+        logger.warning(
+            "- PHEASY_N_JOBS=%d would need ~%.1f GB for the cluster-space copies "
+            "but only %.1f GB is available; capping to %d worker(s).",
+            n_jobs, n_jobs * per_worker * 3.0 / 1e9, avail / 1e9, capped,
+        )
+    return capped
+
+
 class WorkFlow(object):
     """Class defining a complete workflow of calculations.
 
@@ -348,19 +388,40 @@ class WorkFlow(object):
                     _n_jobs = int(os.environ.get("PHEASY_N_JOBS", "1"))
                     _ndata = min(settings.NDATA, u_matrix.shape[0])
                     _u_list = [u_matrix[n, :, :] for n in range(_ndata)]
+                    # [FIX P04] joblib 会把整个 CS_full pickle 给每个 worker
+                    # (大体系可达 GB 级/进程)。原代码既不限并发也不捕获 worker
+                    # 被 OOM-killer 干掉的情况, 日志停在 "N workers." 之后什么
+                    # 都没有, 看起来像卡死。这里: 先按可用内存压 n_jobs, 再对
+                    # worker 崩溃做串行回退。
+                    _n_jobs = _cap_n_jobs_by_memory(_n_jobs, self.CS_full)
                     if _n_jobs != 1:
                         logger.info(
                             "- Parallel sensing matrix construction: {} workers.".format(_n_jobs)
                         )
-                        _results = Parallel(n_jobs=_n_jobs)(
-                            delayed(_build_sensing_matrix_sparse)(self.CS_full, _u)
-                            for _u in _u_list
-                        )
-                        sensing_mat_list.extend(_results)
-                    else:
-                        for _u in _u_list:
+                        try:
+                            _results = Parallel(n_jobs=_n_jobs)(
+                                delayed(_build_sensing_matrix_sparse)(self.CS_full, _u)
+                                for _u in _u_list
+                            )
+                            sensing_mat_list.extend(_results)
+                        except Exception as _e:
+                            logger.error(
+                                "- Parallel sensing-matrix workers failed (%s: %s). "
+                                "This is almost always the OOM killer: every worker "
+                                "holds its own copy of the cluster space. Falling back "
+                                "to serial construction; set PHEASY_N_JOBS=1 to skip "
+                                "this attempt next time.",
+                                type(_e).__name__, _e,
+                            )
+                            sensing_mat_list.clear()
+                            _n_jobs = 1
+                    if _n_jobs == 1:
+                        for _i, _u in enumerate(_u_list):
                             sensing_mat = build_sensing_matrix(self.CS_full, _u)
                             sensing_mat_list.append(sensing_mat)
+                            if (_i + 1) % 10 == 0 or (_i + 1) == len(_u_list):
+                                logger.info("- Sensing matrix: {} / {} configurations."
+                                            .format(_i + 1, len(_u_list)))
                 else:
                     logger.info(
                         "Displacing atoms randomly by {} A.".format(settings.U_VAL)
@@ -438,11 +499,11 @@ class WorkFlow(object):
                 if spmat.issparse(_b):
                     if _b.format != 'csr':
                         _b = _b.tocsr()
-                    if _b.dtype != np.float32:
+                    if _b.dtype != np.dtype(_sm_dtype()):   # [FIX P06]
                         _b = _b.astype(_sm_dtype())
                 else:
                     # 串行 fallback 路径仍可能给 dense
-                    _b = spmat.csr_matrix(_b, dtype=np.float32)
+                    _b = spmat.csr_matrix(_b, dtype=_sm_dtype())
                 _sparse_blocks.append(_b)
             print(f'[SM] blocks converted in {_t_sm.time()-_t0:.1f}s, vstacking...',
                   flush=True)
@@ -499,7 +560,7 @@ class WorkFlow(object):
                 SM_prime = _sm[:_n_keep, :]
             else:
                 SM_prime = _sm
-            if SM_prime.dtype != np.float32:
+            if SM_prime.dtype != np.dtype(_sm_dtype()):     # [FIX P06]
                 SM_prime = SM_prime.astype(_sm_dtype())
             _mem = (SM_prime.data.nbytes
                     + SM_prime.indices.nbytes
@@ -508,6 +569,14 @@ class WorkFlow(object):
                 f'SM_prime kept sparse {SM_prime.dtype} CSR: shape={SM_prime.shape}, '
                 f'nnz={SM_prime.nnz}, mem={_mem:.2f} GB'
             )
+            # [FIX P06] SM / NS / FM now all follow PHEASY_SM_DTYPE (default
+            # float64). float32 halves the memory at the cost of lsmr only
+            # reaching ~1e-7 relative accuracy (istop=5).
+            if _mem > float(os.environ.get('PHEASY_SM_MEM_HINT_GB', '8')):
+                logger.warning(
+                    '- SM_prime is %.1f GB in %s. Set PHEASY_SM_DTYPE=float32 '
+                    'to halve it (all matrices stay consistent).',
+                    _mem, SM_prime.dtype)
 
             if settings.QE:
                 file_format = "qe"
@@ -864,8 +933,16 @@ class WorkFlow(object):
                     # scipy sparse CSR 原生支持, 无需 dense. 故 RFE 也走 sparse 路径,
                     # 避免 668 GB dense materialization (cutoff 5.5 规模).
                     # RFE_TSQR 仍需 dense (Q-less TSQR 走 dense R), 保持排除.
-                    _is_rfe = _os_p.environ.get('PHEASY_USE_RFE','').lower() in ('1','true','yes')
-                    _is_rfe_tsqr = _os_p.environ.get('PHEASY_USE_RFE_TSQR','').lower() in ('1','true','yes')
+                    # [FIX P01] 方法判定必须以 settings.MODEL 为准。
+                    # 旧代码只认 PHEASY_USE_* 环境变量, 而新 CLI (-l RFE /
+                    # -l RFE-OLS-TSQR) 根本不设这些变量 -> _use_sparse 恒为 False,
+                    # 于是 RFE 总是走 dense 分支物化 sm_dense.npy (大 cutoff 下数百 GB),
+                    # 所有 sparse / two-level 的内存优化对新接口全部失效。
+                    _model_up = settings.MODEL.upper().replace('_', '-')
+                    _is_rfe = (_model_up == 'RFE') or (
+                        _os_p.environ.get('PHEASY_USE_RFE','').lower() in ('1','true','yes'))
+                    _is_rfe_tsqr = (_model_up in ('RFE-OLS-TSQR', 'RFE-TSQR')) or (
+                        _os_p.environ.get('PHEASY_USE_RFE_TSQR','').lower() in ('1','true','yes'))
                     _lasso_sparse = _os_p.environ.get('PHEASY_LASSO_SPARSE','').lower() in ('1','true','yes')
                     # RFE 默认开 sparse (除非显式 PHEASY_RFE_SPARSE=0); LASSO/ALASSO 看 PHEASY_LASSO_SPARSE
                     _rfe_sparse = _os_p.environ.get('PHEASY_RFE_SPARSE','1').lower() in ('1','true','yes')
@@ -889,10 +966,10 @@ class WorkFlow(object):
                         _ns_sp = self.NS_full
                         if not _sp_p.issparse(_ns_sp):
                             _ns_sp = _sp_p.csr_matrix(_ns_sp)
-                        _ns_sp = _ns_sp.astype(_np_p.float32)
+                        _ns_sp = _ns_sp.astype(_sm_dtype())     # [FIX P06]
                         if not _sp_p.issparse(SM_prime):
                             SM_prime = _sp_p.csr_matrix(SM_prime)
-                        SM_prime = SM_prime.astype(_np_p.float32)
+                        SM_prime = SM_prime.astype(_sm_dtype())
                         print(f'[SM-sparse] ALASSO/LASSO sparse path: '
                               f'{SM_prime.shape} x {_ns_sp.shape}', flush=True)
                         if _twolevel:
@@ -922,27 +999,80 @@ class WorkFlow(object):
                                   flush=True)
                         else:
                             SM = SM_prime.dot(_ns_sp).tocsr()
+                            _dens = SM.nnz / float(SM.shape[0] * SM.shape[1])
                             print(f'[SM-sparse] done in {_ts_sp.time()-_t0_sp:.1f}s, '
                                   f'SM={SM.shape} nnz={SM.nnz} '
-                                  f'density={SM.nnz/(SM.shape[0]*SM.shape[1])*100:.2f}% '
+                                  f'density={_dens*100:.2f}% '
                                   f'mem={(SM.data.nbytes+SM.indices.nbytes+SM.indptr.nbytes)/1e9:.1f}GB (sparse)',
                                   flush=True)
                             del SM_prime, _ns_sp
+                            # [FIX P18] CSR costs ~2x dense per stored element
+                            # (data + int32 index) and column-slicing it in the
+                            # RFE loop is much slower. When SM comes out nearly
+                            # dense anyway, and dense fits the budget, densify.
+                            _dens_thr = float(_os_p.environ.get('PHEASY_SM_DENSIFY_DENSITY', '0.5'))
+                            _dens_gb = float(_os_p.environ.get('PHEASY_MAX_DENSE_GB', '16'))
+                            _need = SM.shape[0] * SM.shape[1] * _np_p.dtype(_sm_dtype()).itemsize
+                            if _dens >= _dens_thr and _need <= _dens_gb * 1e9:
+                                SM = _np_p.ascontiguousarray(SM.toarray(), dtype=_sm_dtype())
+                                print(f'[SM-sparse] density {_dens*100:.1f}% >= '
+                                      f'{_dens_thr*100:.0f}%, densified to '
+                                      f'{SM.nbytes/1e9:.2f} GB {SM.dtype} '
+                                      f'(PHEASY_SM_DENSIFY_DENSITY / PHEASY_MAX_DENSE_GB)',
+                                      flush=True)
                     else:
                         # ===== 原 dense 路径 (RFE + 默认 LASSO, 完全不变) =====
                         _SM_F = 'sm_dense.npy'
                         _exp = (SM_prime.shape[0], self.NS_full.shape[1])
                         _force = _os_p.environ.get('FORCE_REBUILD','false').lower()=='true'
+                        # [FIX P02] 旧缓存只按 (shape, dtype) 命中, 换一份位移数据
+                        # 或 cp -r 过来的目录会静默复用陈旧 SM。改为额外校验来源指纹:
+                        # sm_prime.npz 的 size+mtime、SM_prime 的 shape/nnz、NS 的 shape。
+                        _SM_META = _SM_F + '.meta.json'
+                        import json as _json_p
+
+                        def _sm_fingerprint():
+                            _src = getattr(self, 'SensingMatrixFile', 'sm_prime.npz')
+                            try:
+                                _st = _os_p.stat(_src)
+                                _src_sig = [_src, int(_st.st_size), int(_st.st_mtime)]
+                            except OSError:
+                                _src_sig = [_src, -1, -1]
+                            return {
+                                'src': _src_sig,
+                                'smp_shape': list(SM_prime.shape),
+                                'smp_nnz': int(getattr(SM_prime, 'nnz', -1)),
+                                'ns_shape': list(self.NS_full.shape),
+                                'dtype': _np_p.dtype(_sm_dtype()).name,
+                                'ndata': int(settings.NDATA),
+                            }
+
+                        _fp_now = _sm_fingerprint()
                         _hit = (not _force) and _os_p.path.exists(_SM_F)
                         if _hit:
                             try:
                                 _chk = _np_p.load(_SM_F, mmap_mode='r')
-                                if _chk.shape != _exp or _chk.dtype != _np_p.float32:
-                                    print(f'[SM-cache] mismatch {_chk.shape}/{_chk.dtype} vs {_exp}/float32, rebuild', flush=True)
+                                if _chk.shape != _exp:
+                                    print(f'[SM-cache] shape mismatch {_chk.shape} vs {_exp}, rebuild', flush=True)
                                     _hit = False
-                                    del _chk
+                                del _chk
                             except Exception as _e:
                                 print(f'[SM-cache] read fail: {_e}, rebuild', flush=True)
+                                _hit = False
+                        if _hit:
+                            try:
+                                with open(_SM_META) as _fh:
+                                    _fp_old = _json_p.load(_fh)
+                            except Exception:
+                                _fp_old = None
+                            if _fp_old != _fp_now:
+                                if _fp_old is None:
+                                    print('[SM-cache] no fingerprint sidecar '
+                                          f'({_SM_META}), rebuild to be safe', flush=True)
+                                else:
+                                    _diff = [k for k in _fp_now
+                                             if _fp_old.get(k) != _fp_now[k]]
+                                    print(f'[SM-cache] STALE: source changed {_diff}, rebuild', flush=True)
                                 _hit = False
                         if _hit:
                             import time as _ts
@@ -955,7 +1085,8 @@ class WorkFlow(object):
                             _NS = self.NS_full.toarray().astype(_sm_dtype())
                             _n_thr = int(_os_p.environ.get('PHEASY_DOT_THREADS', _os_p.environ.get('OMP_NUM_THREADS','64')))
                             print(f'[PATCH] parallel sparse.dot: {SM_prime.shape} x {_NS.shape}, threads={_n_thr}', flush=True)
-                            SM = _np_p.empty((SM_prime.shape[0], _NS.shape[1]), dtype=_np_p.float32)
+                            SM = _np_p.empty((SM_prime.shape[0], _NS.shape[1]),
+                                             dtype=_sm_dtype())     # [FIX P06]
                             _rs = SM_prime.shape[0]
                             _cs = max(1, (_rs + _n_thr - 1) // _n_thr)
                             def _fc(i):
@@ -970,6 +1101,8 @@ class WorkFlow(object):
                             print(f'[SM-cache] saving {_SM_F} ({SM.nbytes/1e9:.1f} GB)...', flush=True)
                             try:
                                 _np_p.save(_SM_F, SM)
+                                with open(_SM_META, 'w') as _fh:      # [FIX P02]
+                                    _json_p.dump(_fp_now, _fh)
                                 print(f'[SM-cache] saved in {_ts.time()-_t0:.1f}s', flush=True)
                             except Exception as _e:
                                 print(f'[SM-cache] save fail: {_e}', flush=True)
@@ -1040,17 +1173,21 @@ class WorkFlow(object):
                 logger.info(
                     "Fitting force constants via Recursive Feature Elimination (RFE) "
                     "with OLS base estimator (scale-invariant importance, grouped CV).")
-            elif settings.MODEL.upper() == "RFE-OLS-TSQR":
+            elif settings.MODEL.upper() in ("RFE-OLS-TSQR", "RFE_TSQR", "RFE-TSQR"):
                 logger.info(
                     "Fitting force constants via strict OLS + RFE "
                     "(tall-skinny Householder QR solver, scale-invariant importance).")
+            elif settings.MODEL.upper() == "RIDGE":
+                # [FIX P03] RIDGE 在 argparse choices 里、Optimizer 也实现了,
+                # 但这里原来没有分支 -> 落到 else 直接 raise ValueError(空消息)。
+                logger.info("Fitting force constants via Ridge regression (L2, CV alpha).")
             else:
-                logger.error(
-                    "Unknown linear model for fitting force constants, {}".format(
-                        settings.MODEL
-                    )
-                )
-                raise ValueError
+                _msg = (
+                    "Unknown linear model for fitting force constants: {!r}. "
+                    "Expected one of OLS, LASSO, ALASSO, RFE, RFE-OLS-TSQR, RIDGE."
+                ).format(settings.MODEL)
+                logger.error(_msg)
+                raise ValueError(_msg)
             rank = SM.shape[1]
             optimizer.fit(SM, FM)
             fit_results = optimizer.results
@@ -1090,10 +1227,16 @@ class WorkFlow(object):
                     logger.info("- alpha_max: {:.3e}".format(float(_used_alpha[-1])))
                 logger.info("- alpha_opt: {}".format(fit_results["alpha"]))
                 logger.info("- RMSE_CV: {} eV/A".format(fit_metrics["rmse_path_mean"]))
-            elif settings.MODEL.upper() == "RFE":
+            elif settings.MODEL.upper() in ("RFE", "RFE-OLS-TSQR", "RFE_TSQR", "RFE-TSQR"):
+                # [FIX P05] TSQR 原来没有汇总分支, 明明算了 CV 却不打印。
                 logger.info("- RFE finished after {} rounds.".format(fit_results["n_iter"]))
                 logger.info("- ridge_alpha: {}".format(fit_results["alpha"]))
                 logger.info("- best CV RMSE: {} eV/A".format(fit_metrics["rmse_path_mean"]))
+                logger.info("- selected features: {} of {}".format(
+                    int(np.count_nonzero(fit_results["coef"])),
+                    fit_results["coef"].shape[0]))
+            elif settings.MODEL.upper() == "RIDGE":
+                logger.info("- alpha_opt: {}".format(fit_results.get("alpha")))
             logger.info("- RMSE: {} eV/A".format(fit_metrics["rmse"]))
             logger.info("- Relative error: {}".format(optimizer.metrics["re"]))
             logger.info("- Rank of coefficient matrix: {}".format(rank))
@@ -1112,14 +1255,25 @@ class WorkFlow(object):
                 Phi = self.NS_full.dot(fit_results["coef"])
                 np.savez_compressed(self.ForceConstantArrayFile, Phi=Phi)
                 FC_model.set_force_constants(Phi)
+
+            # [FIX P22] phi.npz (written just above) already carries the full
+            # IFC vector; fc*.hdf5 is only its expansion over atom triplets and
+            # costs O(natoms^order) memory. Skip it for parameter sweeps.
+            _skip_fc = os.environ.get(
+                "PHEASY_SKIP_FC_WRITE", "").lower() in ("1", "true", "yes")
+            if _skip_fc:
+                logger.info(
+                    "PHEASY_SKIP_FC_WRITE=1: skipping fc2/fc3/fc4 expansion; "
+                    "phi.npz holds the complete force constants.")
+            elif not settings.FIX_FC2:
                 FC_model.write_force_constants(settings, self.CS_full, order=2)
                 logger.info("Writing second-order force constants into file.")
 
-            if settings.MAX_ORDER > 2:
+            if not _skip_fc and settings.MAX_ORDER > 2:
                 FC_model.write_force_constants(settings, self.CS_full, order=3)
                 logger.info("Writing third-order force constants into file.")
 
-            if settings.MAX_ORDER > 3:
+            if not _skip_fc and settings.MAX_ORDER > 3:
                 FC_model.write_force_constants(settings, self.CS_full, order=4)
                 logger.info("Writing fourth-order force constants into file.")
 

@@ -432,13 +432,15 @@ _SM_DTYPES = {
 def get_sm_dtype(default="float64"):
     """sensing matrix 及其下游矩阵 (SM_prime / NS / FM / X) 的浮点精度。
 
-    由环境变量 ``PHEASY_SM_DTYPE`` 控制, 取值 ``float32`` (默认) 或 ``float64``。
+    由环境变量 ``PHEASY_SM_DTYPE`` 控制, 取值 ``float32`` 或 ``float64`` (默认)。
 
     float32 内存减半, 但 lsmr 只能收敛到约 1e-7 相对精度 (istop=5);
     float64 精度更高而内存翻倍。同一次求解中所有矩阵必须使用同一 dtype,
     否则 scipy 会静默升型, 内存优势消失且行为难以预期。
 
-    默认值保持 float32, 以确保不改变既有行为。
+    [FIX P14] 默认值是 **float64** (函数签名的 default 参数), 早先的
+    docstring 写成 float32 与代码相反; 且 run_pheasy.py 里若干处曾硬编码
+    float32 而绕过本函数, 造成 SM=float32 / FM=float64 的混合精度。
     """
     raw = _os_smd.environ.get("PHEASY_SM_DTYPE", default).strip().lower()
     if raw not in _SM_DTYPES:

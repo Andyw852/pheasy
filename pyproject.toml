@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pheasy"
+version = "0.0.2"
+description = "Force-constant extraction from finite displacements via compressive sensing"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.8",
+    "scikit-learn>=1.1",
+    "spglib>=2.0",
+    "phonopy>=2.17",
+    "ase>=3.22",
+    "h5py>=3.6",
+    "joblib>=1.2",
+    "f90nml>=1.4",
+]
+
+[project.optional-dependencies]
+fast = ["celer>=0.7"]
+
+[project.scripts]
+pheasy = "pheasy.run_pheasy:main"
+
+# Flat layout: the repository root IS the ``pheasy`` package (it holds
+# __init__.py directly), so packages.find with include=["pheasy*"] matches
+# nothing and installs an empty distribution. Map the package names explicitly.
+[tool.setuptools]
+packages = ["pheasy", "pheasy.core", "pheasy.interface", "pheasy.structure"]
+
+[tool.setuptools.package-dir]
+"pheasy" = "."
+"pheasy.core" = "core"
+"pheasy.interface" = "interface"
+"pheasy.structure" = "structure"

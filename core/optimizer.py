@@ -488,6 +488,30 @@ class _OLSModel:
         return np.asarray(A @ self.coef_).ravel()
 
 
+def _lasso_n_jobs(A):
+    """[FIX P24] Cap sklearn LassoCV process parallelism by matrix size.
+
+    LassoCV(n_jobs=N) fans the (alpha, fold) grid out to N loky *processes*;
+    each worker copies the centered training fold of the dense design matrix,
+    so N=-1 (one worker per core) on a many-core host blows up memory and the
+    OOM killer SIGTERMs the run. Default to a memory-aware, bounded worker count.
+    """
+    n = int(os.environ.get("PHEASY_N_JOBS", "-1"))
+    if n in (0, 1):
+        return 1
+    n_cpu = int(os.environ.get("PHEASY_MAX_CORES", str(os.cpu_count() or 1)))
+    if n < 0:
+        n = n_cpu
+    n = min(n, n_cpu)
+    try:
+        per_worker = int(A.shape[0]) * int(A.shape[1]) * 8
+        budget = int(float(os.environ.get("PHEASY_LASSO_MEM_GB", "6"))) * 2 ** 30
+        cap = max(1, int(budget // max(per_worker, 1)))
+    except Exception:
+        cap = 4
+    return max(1, min(n, cap, 16))
+
+
 class _LassoCVModel:
     """Thin wrapper around sklearn LassoCV with correct alpha grid and grouped CV."""
 
@@ -888,14 +912,14 @@ class Optimizer(object):
         elif method == "LASSO":
             self._model = _LassoCVModel(
                 self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
-                int(os.environ.get("PHEASY_N_JOBS", "-1")),
+                _lasso_n_jobs(A),
                 fit_intercept=self._fit_intercept, group_size=self._group_size)
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "ALASSO":
             self._model = _AdaptiveLassoCV(
                 self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
-                int(os.environ.get("PHEASY_N_JOBS", "-1")),
+                _lasso_n_jobs(A),
                 fit_intercept=self._fit_intercept, group_size=self._group_size,
                 gamma=float(os.environ.get("PHEASY_ALASSO_GAMMA", "1.0")),
                 init_alpha=float(os.environ.get("PHEASY_ALASSO_RIDGE_ALPHA", "1e-3")),
