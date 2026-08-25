@@ -80,8 +80,40 @@ def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
     return list(kf.split(np.arange(n_samples)))
 
 
+def _solve_sparse_lsqr(A, y):
+    """Iterative least squares (LSQR) for sparse / LinearOperator input.
+
+    Only needs matvec / rmatvec, so peak memory is ~O(n_features) instead of
+    densifying the sensing matrix (which for e.g. 685968 x 51590 would be
+    ~280 GB). This is the same Krylov approach used by symfc / phonopy.
+    """
+    from scipy.sparse.linalg import lsqr as _sp_lsqr
+    atol = float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8"))
+    btol = float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8"))
+    iter_lim = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    res = _sp_lsqr(A, y64, atol=atol, btol=btol, iter_lim=iter_lim)
+    return np.asarray(res[0], dtype=np.float64)
+
+
+def _should_densify_sparse(A):
+    """True when densifying a sparse matrix is cheap enough (memory budget).
+
+    A sparse container that is actually 100% dense (e.g. SM = SM_prime @ NS for
+    small systems) is densified so the faster SVD/QR solvers run; genuinely
+    sparse / huge matrices stay sparse and use the iterative LSQR solver.
+    """
+    n, m = A.shape
+    max_dense = int(os.environ.get("PHEASY_MAX_DENSE", "200000000"))
+    return (n * m) <= max_dense
+
+
 def _solve_lstsq(A, y, driver="gelsd"):
-    """Ordinary least squares via scipy (SVD by default)."""
+    """Ordinary least squares: SVD for dense/small, LSQR for sparse/huge."""
+    if _is_linear_operator(A):
+        return _solve_sparse_lsqr(A, y)
+    if sp.issparse(A) and not _should_densify_sparse(A):
+        return _solve_sparse_lsqr(A, y)
     A64 = _to_dense_f64(A)
     y64 = np.asarray(y, dtype=np.float64).ravel()
     try:
@@ -94,15 +126,27 @@ def _solve_lstsq(A, y, driver="gelsd"):
 def _solve_qr(A, y):
     """OLS via tall-skinny QR (Householder QR + triangular solve).
 
-    Numerically stable for full-column-rank matrices and faster than a full SVD.
-    Falls back to the SVD driver when R is (nearly) rank deficient.
+    Numerically stable for full-column-rank matrices. Sparse / LinearOperator
+    input falls back to LSQR (scipy has no sparse QR least-squares driver; LSQR
+    is a Golub-Kahan bidiagonalization, QR-like, and memory efficient).
     """
+    if _is_linear_operator(A):
+        return _solve_sparse_lsqr(A, y)
+    if sp.issparse(A) and not _should_densify_sparse(A):
+        return _solve_sparse_lsqr(A, y)
     A64 = _to_dense_f64(A)
     y64 = np.asarray(y, dtype=np.float64).ravel()
     Q, R = spla.qr(A64, mode="economic", check_finite=False)
     diag = np.abs(np.diag(R))
-    tol = np.finfo(float).eps * max(A64.shape) * max(diag.max(), 1.0)
-    if diag.size == 0 or diag.min() <= tol:
+    if diag.size == 0:
+        return _solve_lstsq(A, y)
+    dmax = float(diag.max())
+    if dmax == 0.0:
+        return _solve_lstsq(A, y)
+    # rank threshold relative to the largest R diagonal (proxy for largest
+    # singular value); fall back to SVD when (nearly) rank deficient.
+    tol = np.finfo(float).eps * max(A64.shape) * dmax
+    if float(diag.min()) <= tol:
         return _solve_lstsq(A, y)
     return np.asarray(
         spla.solve_triangular(R, Q.T @ y64, lower=False, check_finite=False),
@@ -110,14 +154,92 @@ def _solve_qr(A, y):
     )
 
 
-def _cv_rmse(A, y, idx, solver, splits):
+def _make_masked_op(A, row_idx, col_idx):
+    """LinearOperator for A[row_idx][:, col_idx] without materializing A."""
+    n_rows_full, n_cols_full = A.shape
+    n_rows = n_rows_full if row_idx is None else len(row_idx)
+    n_cols = len(col_idx)
+    dt = np.dtype(A.dtype) if hasattr(A, "dtype") else np.dtype(np.float64)
+
+    def mv(v):
+        v = np.asarray(v, dtype=dt).ravel()
+        v_full = np.zeros(n_cols_full, dtype=dt)
+        v_full[col_idx] = v
+        out = np.asarray(A @ v_full).ravel()
+        return out if row_idx is None else out[row_idx]
+
+    def rmv(u):
+        u = np.asarray(u, dtype=dt).ravel()
+        if row_idx is not None:
+            u_full = np.zeros(n_rows_full, dtype=dt)
+            u_full[row_idx] = u
+        else:
+            u_full = u
+        return np.asarray(A.T @ u_full).ravel()[col_idx]
+
+    return LinearOperator((n_rows, n_cols), matvec=mv, rmatvec=rmv, dtype=dt)
+
+
+def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False):
+    """Solve min ||A[row_idx][:, col_idx] x - y[row_idx]||^2 (+ optional ridge)."""
+    y_sub = np.asarray(y, dtype=np.float64).ravel()
+    if row_idx is not None:
+        y_sub = y_sub[row_idx]
+    if _is_linear_operator(A):
+        # LSMR on a masked operator: no materialization, memory ~O(n_features).
+        op = _make_masked_op(A, row_idx, col_idx)
+        n = len(col_idx)
+        atol = float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8"))
+        btol = float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8"))
+        maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
+        if ridge_alpha > 0:
+            sqrt_a = float(np.sqrt(ridge_alpha))
+
+            def mv_aug(v):
+                v = np.asarray(v, dtype=np.float64).ravel()
+                return np.concatenate([np.asarray(op @ v).ravel(), sqrt_a * v])
+
+            def rmv_aug(u):
+                u = np.asarray(u, dtype=np.float64).ravel()
+                return (np.asarray(op.T @ u[: op.shape[0]]).ravel()
+                        + sqrt_a * u[op.shape[0]:])
+
+            op = LinearOperator((op.shape[0] + n, n), matvec=mv_aug,
+                                rmatvec=rmv_aug, dtype=np.float64)
+            y_sub = np.concatenate([y_sub, np.zeros(n)])
+        res = _lsmr(op, y_sub, atol=atol, btol=btol, maxiter=maxiter)
+        return np.asarray(res[0], dtype=np.float64)
+
+    A_sub = A[:, col_idx]
+    if row_idx is not None:
+        A_sub = A_sub[row_idx]
+    if ridge_alpha > 0:
+        ridge = Ridge(alpha=ridge_alpha, fit_intercept=False, solver="lsqr")
+        ridge.fit(A_sub, y_sub)
+        return ridge.coef_
+    if qr:
+        return _solve_qr(A_sub, y_sub)
+    return _solve_lstsq(A_sub, y_sub)
+
+
+def _predict_subset(A, col_idx, row_idx, coef):
+    """A[row_idx][:, col_idx] @ coef."""
+    if _is_linear_operator(A):
+        return np.asarray(_make_masked_op(A, row_idx, col_idx) @ coef).ravel()
+    A_sub = A[:, col_idx]
+    if row_idx is not None:
+        A_sub = A_sub[row_idx]
+    return np.asarray(A_sub @ coef).ravel()
+
+
+def _cv_rmse(A, y, idx, solve, splits):
     """K-fold CV RMSE (mean, standard error, per-fold) for active columns idx."""
-    A_sub = A[:, idx]
+    y64 = np.asarray(y, dtype=np.float64).ravel()
     fold = np.empty(len(splits), dtype=np.float64)
     for k, (tr, va) in enumerate(splits):
-        coef = solver(A_sub[tr], y[tr])
-        pred = A_sub[va] @ coef
-        err = pred - y[va]
+        coef = solve(idx, tr)
+        pred = _predict_subset(A, idx, va, coef)
+        err = pred - y64[va]
         fold[k] = np.sqrt(np.mean(err * err))
     mean = float(fold.mean())
     se = float(fold.std(ddof=1) / np.sqrt(len(fold))) if len(fold) > 1 else 0.0
@@ -241,11 +363,11 @@ class _AdaptiveLassoCV(_LassoCVModel):
         self._weights = None
 
     def _initial_estimate(self, A, y):
-        A64 = _to_dense_f64(A)
+        # solver="lsqr" handles dense AND sparse without densifying
         y64 = np.asarray(y, dtype=np.float64).ravel()
         ridge = Ridge(alpha=self.init_alpha, fit_intercept=self.fit_intercept,
                       solver="lsqr")
-        ridge.fit(A64, y64)
+        ridge.fit(A, y64)
         return ridge.coef_
 
     def fit(self, A, y, sample_weight=None):
@@ -311,17 +433,6 @@ class _RFECVBase:
         self.ridge_alpha = float(ridge_alpha)
         self._solver_name = solver
 
-    def _make_solver(self, A):
-        if self.ridge_alpha > 0:
-            ridge = Ridge(alpha=self.ridge_alpha, fit_intercept=False, solver="lsqr")
-            def _ridge(X, y):
-                ridge.fit(_to_dense_f64(X), np.asarray(y, dtype=np.float64).ravel())
-                return ridge.coef_
-            return _ridge
-        if self._solver_name == "qr":
-            return _solve_qr
-        return _solve_lstsq
-
     def _cv_group_size(self, n_samples):
         gs = int(os.environ.get("PHEASY_CV_GROUP_SIZE", "0"))
         if gs > 1 and n_samples % gs == 0:
@@ -330,15 +441,16 @@ class _RFECVBase:
 
     def fit(self, A, y, sample_weight=None):
         y = np.asarray(y, dtype=np.float64).ravel()
-        if _is_linear_operator(A):
-            # RFE needs explicit column slicing (A[:, idx]); a LinearOperator
-            # (e.g. TwoLevelSM) has no __getitem__, so materialize it once.
-            A = _to_dense_f64(A)
         n_samples, n_features = A.shape
         self.n_features_in_ = n_features
 
         col_norms = _col_norms(A)
-        solver = self._make_solver(A)
+        _qr = self._solver_name == "qr"
+
+        def solve(col_idx, row_idx=None):
+            return _solve_subset(A, y, row_idx, col_idx,
+                                 self.ridge_alpha, _qr)
+
         splits = _make_cv_splits(n_samples, self.cv, self.random_state,
                                  self._cv_group_size(n_samples))
 
@@ -362,8 +474,8 @@ class _RFECVBase:
             if n_active <= self.min_features:
                 break
 
-            coef_active = solver(A[:, idx], y)
-            cv_mean, cv_se, _ = _cv_rmse(A, y, idx, solver, splits)
+            coef_active = solve(idx)
+            cv_mean, cv_se, _ = _cv_rmse(A, y, idx, solve, splits)
             history.append((n_active, cv_mean, cv_se, active.copy()))
 
             if self.verbose:
@@ -407,7 +519,7 @@ class _RFECVBase:
             print(f"[RFE] selected: n_active={n_best}, CV={best_mean:.6e} "
                   f"(+-{best_se:.2e})", flush=True)
 
-        coef_final = solver(A[:, best_idx], y)
+        coef_final = solve(best_idx)
         coef_full = np.zeros(n_features, dtype=np.float64)
         coef_full[best_idx] = coef_final
 

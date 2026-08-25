@@ -1015,11 +1015,11 @@ class WorkFlow(object):
             elif settings.MODEL.upper() == "RFE":
                 logger.info(
                     "Fitting force constants via Recursive Feature Elimination (RFE) "
-                    "with Ridge base estimator (dense SM + LinearOperator, no copy).")
+                    "with OLS base estimator (scale-invariant importance, grouped CV).")
             elif settings.MODEL.upper() == "RFE-OLS-TSQR":
                 logger.info(
                     "Fitting force constants via strict OLS + RFE "
-                    "(Q-less augmented Tall-Skinny QR, R-space inheritance).")
+                    "(tall-skinny Householder QR solver, scale-invariant importance).")
             else:
                 logger.error(
                     "Unknown linear model for fitting force constants, {}".format(

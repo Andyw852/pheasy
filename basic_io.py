@@ -312,8 +312,12 @@ class InputParser(argparse.ArgumentParser):
             action="store",
             default="OLS",
             type=str,
-            choices=["OLS", "LASSO"],
-            help="Linear model for fitting force constants.",
+            choices=["OLS", "LASSO", "ALASSO", "RFE", "RFE-OLS-TSQR", "RIDGE"],
+            help="Linear model for fitting force constants: "
+                 "OLS (ordinary least squares), LASSO (L1 + CV alpha), "
+                 "ALASSO (adaptive LASSO), RFE (recursive feature "
+                 "elimination), RFE-OLS-TSQR (RFE with tall-skinny QR "
+                 "solver), or RIDGE.",
         )
         try:
             self.add_argument(
