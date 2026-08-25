@@ -574,10 +574,13 @@ class _AdaptiveLassoCV(_LassoCVModel):
         self._weights = None
 
     def _initial_estimate(self, A, y):
-        # solver="lsqr" handles dense AND sparse without densifying
+        # [FIX P25] solver="auto" picks cholesky/svd for dense and sparse_cg
+        # for sparse (both without densifying).  The previous "lsqr" is
+        # iterative and on a DENSE underdetermined design matrix spends ~10 min
+        # in scipy's lsqr where LAPACK svd needs seconds -- same ridge solution.
         y64 = np.asarray(y, dtype=np.float64).ravel()
         ridge = Ridge(alpha=self.init_alpha, fit_intercept=self.fit_intercept,
-                      solver="lsqr")
+                      solver="auto")
         ridge.fit(A, y64)
         return ridge.coef_
 
