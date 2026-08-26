@@ -375,8 +375,80 @@ def _estimate_lipschitz(A, power_iters=15):
     return L * safety
 
 
+def _top_eigval(G):
+    """Largest eigenvalue of a symmetric PSD matrix (exact LAPACK).
+
+    [FIX P34] ||A||^2 = lambda_max(A^T A) exactly for the Gram path, replacing
+    the power-iteration estimate (and its safety factor) with a tighter step.
+    """
+    G = np.asarray(G, dtype=np.float64)
+    n = G.shape[0]
+    if n == 0:
+        return 0.0
+    try:
+        return float(spla.eigvalsh(G, subset_by_index=(n - 1, n - 1))[0])
+    except TypeError:
+        # older scipy without subset_by_index: full eigendecomposition fallback
+        return float(spla.eigvalsh(G)[-1])
+
+
+def _gram_smprime(SM_prime, block_rows=2000):
+    """P = SM_prime^T SM_prime via blocked densification + BLAS gemm.
+
+    [FIX P34] SM_prime (n x mid) may be huge and sparse; densifying it all at
+    once costs n*mid*8 bytes. Processing row blocks keeps peak memory at
+    block_rows*mid*8 and accumulates the mid x mid Gram with BLAS.
+    """
+    n, mid = SM_prime.shape
+    P = np.zeros((mid, mid), dtype=np.float64)
+    for i0 in range(0, n, block_rows):
+        B = np.asarray(SM_prime[i0:i0 + block_rows].toarray(), dtype=np.float64)
+        P += B.T @ B
+    return P
+
+
+def _gram_budget_ok(A, max_gb=None):
+    """[FIX P34] True if the Gram matrices fit the memory budget.
+
+    For TwoLevelSM the dominant intermediate is P = SM_prime^T SM_prime
+    (mid x mid), which can exceed G (n_features x n_features) when the null
+    space projects a lot of columns away. Default 4 GB ~ 23000 dof.
+    """
+    max_gb = float(os.environ.get("PHEASY_GRAM_MAX_GB", "4")) if max_gb is None else float(max_gb)
+    mid = getattr(A, "SM_prime", None)
+    peak_dim = mid.shape[1] if mid is not None else A.shape[1]
+    return peak_dim * peak_dim * 8.0 / 1e9 <= max_gb
+
+
+def _compute_gram(A, y):
+    """Precompute G = A^T A (n_features x n_features) and b = A^T y.
+
+    [FIX P34] For TwoLevelSM the Gram is built factorized (P = SM_prime^T
+    SM_prime, then G = NS^T P NS) without ever materializing the full SM.
+    Returns (G, b, P): P is the SM_prime Gram kept so folds can use the cheap
+    P_full - P_va identity instead of recomputing per fold.
+    """
+    n, m = A.shape
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    b = np.asarray(A.T @ y64, dtype=np.float64).ravel()
+    P = None
+    if hasattr(A, "SM_prime"):  # TwoLevelSM
+        P = _gram_smprime(A.SM_prime)
+        G = np.asarray(A.NS.T @ (P @ A.NS), dtype=np.float64)
+    elif sp.issparse(A):
+        G = np.asarray((A.T @ A).toarray(), dtype=np.float64)
+    elif _is_linear_operator(A):
+        I = np.eye(m, dtype=np.float64)
+        G = np.asarray(A.T @ (A @ I), dtype=np.float64)
+    else:
+        A64 = np.asarray(A, dtype=np.float64)
+        G = A64.T @ A64
+    return G, b, P
+
+
 def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
-                 lipschitz=None, penalty_weights=None, _info=None):
+                 lipschitz=None, penalty_weights=None, _info=None,
+                 gram=None):
     """Solve min 0.5||A x - y||^2 + alpha * sum_j w_j |x_j| via FISTA.
 
     [FIX P26] Matvec-only LASSO so LASSO / ALASSO can run on a TwoLevelSM /
@@ -404,8 +476,12 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
             _info["n_iter"] = 0
         return _solve_sparse_lsqr(A, y64)
 
+    if gram is not None:
+        G, b = gram
+    else:
+        G = b = None
     if lipschitz is None:
-        lipschitz = _estimate_lipschitz(A)
+        lipschitz = _top_eigval(G) if gram is not None else _estimate_lipschitz(A)
     step = 1.0 / max(float(lipschitz), 1e-12)
     # sklearn LassoCV convention is (1/(2 n_samples))||Ax-y||^2 + alpha||x||_1,
     # which equals 0.5||Ax-y||^2 + (n_samples*alpha)||x||_1 -- so the L1 weight
@@ -420,8 +496,12 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
     n_iter = 0
     for it in range(int(max_iter)):
         n_iter = it + 1
-        Az = np.asarray(A @ z, dtype=np.float64).ravel()
-        grad = np.asarray(A.T @ (Az - y64), dtype=np.float64).ravel()
+        if gram is not None:
+            # [FIX P34] gradient from the precomputed Gram: A^T(A z - y) = G z - b
+            grad = np.asarray(G @ z, dtype=np.float64).ravel() - b
+        else:
+            Az = np.asarray(A @ z, dtype=np.float64).ravel()
+            grad = np.asarray(A.T @ (Az - y64), dtype=np.float64).ravel()
         x_new = _soft_threshold(z - step * grad, thr)
 
         # FISTA with adaptive restart (O'Donoghue & Candes 2015): reset the
@@ -797,7 +877,47 @@ class _LassoCVIterative:
         splits = _make_cv_splits(A.shape[0], self.cv, self.rand_seed,
                                  self.group_size)
         n_alphas = len(self.alphas)
-        self._lipschitz = _estimate_lipschitz(A)
+
+        # [FIX P34] build the Gram A^T A (and per-fold variants) when it fits the
+        # memory budget, then FISTA runs a dense n_features x n_features matvec
+        # per iteration instead of two sparse multiplies over the full SM. On a
+        # budget miss (or a build error) fall back to the matvec path.
+        use_gram = False
+        gram_full = None
+        gram_folds = None
+        lip_full = None
+        lip_folds = None
+        A_va_list = None
+        if _gram_budget_ok(A):
+            try:
+                G_full, b_full, _P = _compute_gram(A, y64)
+                gram_full = (G_full, b_full)
+                lip_full = _top_eigval(G_full)
+                gram_folds = []
+                lip_folds = []
+                A_va_list = []
+                for _tr, va in splits:
+                    A_va = _row_slice(A, va)
+                    G_va, b_va, _ = _compute_gram(A_va, y64[va])
+                    G_tr = G_full - G_va
+                    gram_folds.append((G_tr, b_full - b_va))
+                    lip_folds.append(_top_eigval(G_tr))
+                    A_va_list.append(A_va)
+                use_gram = True
+                print("[optimizer] Gram path: G=%dx%d built (PHEASY_GRAM_MAX_GB=%s); "
+                      "per-iter cost is a dense matvec, no full-SM multiply."
+                      % (G_full.shape[0], G_full.shape[1],
+                         os.environ.get("PHEASY_GRAM_MAX_GB", "4")), flush=True)
+            except Exception as _e:
+                print("[optimizer] WARNING: Gram build failed (%s); falling back "
+                      "to matvec FISTA." % _e, flush=True)
+                use_gram = False
+        if use_gram:
+            self._lipschitz = lip_full
+            self._gram = gram_full
+        else:
+            self._lipschitz = _estimate_lipschitz(A)
+            self._gram = None
 
         # CV folds only need to RANK the alphas, so a loose tolerance and a low
         # iteration budget suffice; the final refit uses the caller's tight tol.
@@ -830,28 +950,44 @@ class _LassoCVIterative:
             alpha = float(self.alphas[a_i])
             fold_mse = np.zeros(len(splits))
             for k, (tr, va) in enumerate(splits):
-                if A_folds is not None:
-                    A_tr = A_folds[k]
+                if use_gram:
+                    coef = _fista_lasso(A, y64, alpha, x0=x_folds[k],
+                                        max_iter=cv_max_iter, tol=cv_tol,
+                                        lipschitz=lip_folds[k],
+                                        penalty_weights=self.penalty_weights,
+                                        gram=gram_folds[k])
+                    pred = np.asarray(A_va_list[k] @ coef, dtype=np.float64).ravel()
                 else:
-                    A_tr = _row_slice(A, tr) if _is_linear_operator(A) else A[tr]
-                # [FIX P28] warm-start from THIS fold's previous-alpha solution,
-                # not the full-data solution: with a loose CV budget the warm
-                # start does not fully wash out, so x_full would leak the
-                # validation rows into the fold fit and bias CV low.
-                coef = _fista_lasso(A_tr, y64[tr], alpha, x0=x_folds[k],
-                                    max_iter=cv_max_iter, tol=cv_tol,
-                                    lipschitz=self._lipschitz,
-                                    penalty_weights=self.penalty_weights)
+                    if A_folds is not None:
+                        A_tr = A_folds[k]
+                    else:
+                        A_tr = _row_slice(A, tr) if _is_linear_operator(A) else A[tr]
+                    # [FIX P28] warm-start from THIS fold's previous-alpha solution,
+                    # not the full-data solution: with a loose CV budget the warm
+                    # start does not fully wash out, so x_full would leak the
+                    # validation rows into the fold fit and bias CV low.
+                    coef = _fista_lasso(A_tr, y64[tr], alpha, x0=x_folds[k],
+                                        max_iter=cv_max_iter, tol=cv_tol,
+                                        lipschitz=self._lipschitz,
+                                        penalty_weights=self.penalty_weights)
+                    pred = _predict_rows(A, coef, va)
                 x_folds[k] = coef
-                err = _predict_rows(A, coef, va) - y64[va]
+                err = pred - y64[va]
                 fold_mse[k] = float(np.mean(err * err))
             mse_path[a_i] = fold_mse
             mean = float(fold_mse.mean())
             # warm-start the next (smaller) alpha from this alpha's full fit
-            x_full = _fista_lasso(A, y64, alpha, x0=x_full,
-                                  max_iter=cv_max_iter, tol=cv_tol,
-                                  lipschitz=self._lipschitz,
-                                  penalty_weights=self.penalty_weights)
+            if use_gram:
+                x_full = _fista_lasso(A, y64, alpha, x0=x_full,
+                                      max_iter=cv_max_iter, tol=cv_tol,
+                                      lipschitz=lip_full,
+                                      penalty_weights=self.penalty_weights,
+                                      gram=gram_full)
+            else:
+                x_full = _fista_lasso(A, y64, alpha, x0=x_full,
+                                      max_iter=cv_max_iter, tol=cv_tol,
+                                      lipschitz=self._lipschitz,
+                                      penalty_weights=self.penalty_weights)
             # [FIX P27] <= (not <) so a tie picks the SMALLEST alpha (the one
             # seen LAST in the descending walk), matching _reselect_alpha's
             # tie-break toward the least-regularized member.
@@ -882,9 +1018,10 @@ class _LassoCVIterative:
         self.coef_ = _fista_lasso(A, y64, self.alpha_, x0=best_x,
                                   max_iter=min(self.max_iter, 5000),
                                   tol=max(float(self.tol), 1e-7),
-                                  lipschitz=self._lipschitz,
+                                  lipschitz=lip_full if use_gram else self._lipschitz,
                                   penalty_weights=self.penalty_weights,
-                                  _info=_finfo)
+                                  _info=_finfo,
+                                  gram=gram_full if use_gram else None)
         self.intercept_ = 0.0
         self.alphas_ = self.alphas
         self.mse_path_ = mse_path
@@ -1406,6 +1543,9 @@ class Optimizer(object):
         # LASSO fit (Meinshausen 2007; used by ALAMODE/phono3py).  Default on;
         # disable with PHEASY_LASSO_DEBIAS=0.
         if method in ("LASSO", "ALASSO") and self._debias_enabled():
+            # [FIX P34] propagate the model's Gram (built on A_fit) so _debias
+            # can solve G[sup,sup] x = b[sup] instead of re-solving the OLS.
+            self._gram = getattr(self._model, "_gram", None)
             coef = self._debias(A_fit, F64, coef)
 
         # un-scale standardized coefficients back to the original column scale
@@ -1485,6 +1625,25 @@ class Optimizer(object):
         """OLS refit on the nonzero support (relaxed LASSO)."""
         sup = np.flatnonzero(np.abs(coef) > 0)
         if not (0 < sup.size < coef.size):
+            return coef
+        gram = getattr(self, "_gram", None)
+        if gram is not None:
+            # [FIX P34] OLS on the support via the Gram: G[sup,sup] x = b[sup]
+            # is a |sup| x |sup| dense solve, far cheaper than re-solving the
+            # full least-squares problem against the operator.
+            G, b = gram
+            Gss = G[np.ix_(sup, sup)]
+            bs = b[sup]
+            try:
+                coef_sub = np.linalg.solve(Gss, bs)
+            except np.linalg.LinAlgError:
+                coef_sub = _solve_lstsq(Gss, bs)
+            new = np.zeros_like(coef)
+            new[sup] = coef_sub
+            r_new = float(np.linalg.norm(np.asarray(A @ new).ravel() - y))
+            r_old = float(np.linalg.norm(np.asarray(A @ coef).ravel() - y))
+            if r_new <= r_old:
+                return new
             return coef
         if _is_linear_operator(A):
             # [FIX P26] column-slice via a masked operator + LSMR, so the
