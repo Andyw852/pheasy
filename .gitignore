@@ -21,3 +21,4 @@ test/*/fc4.hdf5
 test/*/FORCE_CONSTANTS
 test/*/FORCE_CONSTANTS_3RD
 test/*/FORCE_CONSTANTS_4TH
+test/*/phi.npz
