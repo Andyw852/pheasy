@@ -765,6 +765,11 @@ class _LassoCVIterative:
     LinearOperator or a sparse matrix too large to densify (see
     _lasso_backend). Never materializes the sensing matrix; peak memory is
     ~O(n_features). The alpha path is walked large->small and warm-started.
+
+    NOTE: this is a memory-for-time trade-off. FISTA converges O(1/k^2) and each
+    TwoLevelSM matvec is two sparse multiplies, so it can be 10-100x slower than
+    the dense sklearn path. It is auto-selected only when the dense SM does not
+    fit in memory (_lasso_backend); PHEASY_LASSO_TWOLEVEL stays off by default.
     """
     def __init__(self, alphas, cv, tol, max_iter, rand_seed, n_jobs=1,
                  fit_intercept=False, group_size=None, selection="cyclic",
@@ -796,10 +801,23 @@ class _LassoCVIterative:
 
         # CV folds only need to RANK the alphas, so a loose tolerance and a low
         # iteration budget suffice; the final refit uses the caller's tight tol.
-        # This keeps the iterative path tractable on large systems (the dense
-        # sklearn path is unaffected).
-        cv_tol = max(float(self.tol), 1e-3)
-        cv_max_iter = min(self.max_iter, 800)
+        # [FIX P32] the knobs are exposed because a flat CV tail (see the tie
+        # warning below) is fixed by tightening these, not by --tol (which only
+        # affects the final refit).
+        cv_tol = float(os.environ.get(
+            "PHEASY_CV_TOL", str(max(float(self.tol), 1e-3))))
+        cv_max_iter = int(os.environ.get(
+            "PHEASY_CV_MAX_ITER", str(min(self.max_iter, 800))))
+
+        # [FIX P33] hoist the per-fold row slices out of the alpha loop so the
+        # CSR / TwoLevelSM slicing is done once instead of n_alphas times.  Off
+        # by default: caching K folds keeps ~(K-1)x SM_prime resident; enable on
+        # big-but-not-huge systems via PHEASY_CV_CACHE_FOLDS=1.
+        _cache_folds = os.environ.get("PHEASY_CV_CACHE_FOLDS", "0").lower() in ("1", "true", "yes")
+        A_folds = None
+        if _cache_folds:
+            A_folds = [_row_slice(A, tr) if _is_linear_operator(A) else A[tr]
+                       for tr, _ in splits]
 
         mse_path = np.zeros((n_alphas, len(splits)))
         x_folds = [None] * len(splits)   # [FIX P28] per-fold warm-start
@@ -812,7 +830,10 @@ class _LassoCVIterative:
             alpha = float(self.alphas[a_i])
             fold_mse = np.zeros(len(splits))
             for k, (tr, va) in enumerate(splits):
-                A_tr = _row_slice(A, tr) if _is_linear_operator(A) else A[tr]
+                if A_folds is not None:
+                    A_tr = A_folds[k]
+                else:
+                    A_tr = _row_slice(A, tr) if _is_linear_operator(A) else A[tr]
                 # [FIX P28] warm-start from THIS fold's previous-alpha solution,
                 # not the full-data solution: with a loose CV budget the warm
                 # start does not fully wash out, so x_full would leak the
@@ -847,7 +868,8 @@ class _LassoCVIterative:
         if tied.size > 1:
             print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). "
                   "The CV solver (FISTA, tol=%.0e, %d iters) is too loose to "
-                  "separate them -- lower PHEASY_CV_TOL / raise max_iter."
+                  "separate them -- lower PHEASY_CV_TOL (now %.0e) or raise "
+                  "PHEASY_CV_MAX_ITER (now %d)."
                   % (tied.size, best_mean, float(self.alphas[tied].min()),
                      float(self.alphas[tied].max()), cv_tol, cv_max_iter),
                   flush=True)
