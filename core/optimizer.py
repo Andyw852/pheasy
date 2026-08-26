@@ -438,8 +438,17 @@ def _compute_gram(A, y):
     elif sp.issparse(A):
         G = np.asarray((A.T @ A).toarray(), dtype=np.float64)
     elif _is_linear_operator(A):
-        I = np.eye(m, dtype=np.float64)
-        G = np.asarray(A.T @ (A @ I), dtype=np.float64)
+        # [FIX P34] build G column-block-wise so a bare LinearOperator does NOT
+        # materialize the full dense SM (n_rows x n_features).  Peak memory is
+        # n_rows x blk instead.
+        G = np.zeros((m, m), dtype=np.float64)
+        blk = int(os.environ.get("PHEASY_GRAM_BLOCK", "64"))
+        for j0 in range(0, m, blk):
+            j1 = min(j0 + blk, m)
+            I_blk = np.zeros((m, j1 - j0), dtype=np.float64)
+            I_blk[j0:j1, :] = np.eye(j1 - j0, dtype=np.float64)
+            A_blk = np.asarray(A @ I_blk, dtype=np.float64)   # n_rows x blk
+            G[:, j0:j1] = np.asarray(A.T @ A_blk, dtype=np.float64)
     else:
         A64 = np.asarray(A, dtype=np.float64)
         G = A64.T @ A64
@@ -448,7 +457,7 @@ def _compute_gram(A, y):
 
 def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
                  lipschitz=None, penalty_weights=None, _info=None,
-                 gram=None):
+                 gram=None, n_samples=None):
     """Solve min 0.5||A x - y||^2 + alpha * sum_j w_j |x_j| via FISTA.
 
     [FIX P26] Matvec-only LASSO so LASSO / ALASSO can run on a TwoLevelSM /
@@ -464,7 +473,8 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
     FISTA down.
     """
     n = A.shape[1]
-    n_samples = A.shape[0]
+    if n_samples is None:
+        n_samples = A.shape[0]
     y64 = np.asarray(y, dtype=np.float64).ravel()
     if x0 is None:
         x = np.zeros(n, dtype=np.float64)
@@ -472,6 +482,9 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
         x = np.asarray(x0, dtype=np.float64).copy()
 
     if alpha <= 0:
+        # [FIX P34] alpha<=0 is never produced by derive_alpha_grid, so this only
+        # matters for direct API use. It still solves A x = y via LSQR (not the
+        # Gram normal equation G x = b, which squares the condition number).
         if _info is not None:
             _info["n_iter"] = 0
         return _solve_sparse_lsqr(A, y64)
@@ -895,6 +908,12 @@ class _LassoCVIterative:
                 lip_full = _top_eigval(G_full)
                 gram_folds = []
                 lip_folds = []
+                # [FIX P34] A_va_list holds the K disjoint VALIDATION slices
+                # (~1x SM_prime total, not the (K-1)x of the P33 train-fold
+                # cache); it pays for the per-fold prediction A[va] @ coef.
+                # G_tr = G_full - G_va: safe for K>=3; for K=2 / LOOCV the
+                # cancellation (G_va ~ G_full) can leave G_tr slightly non-PSD
+                # (harmless to eigvalsh lambda_max, but noted).
                 A_va_list = []
                 for _tr, va in splits:
                     A_va = _row_slice(A, va)
@@ -951,11 +970,16 @@ class _LassoCVIterative:
             fold_mse = np.zeros(len(splits))
             for k, (tr, va) in enumerate(splits):
                 if use_gram:
+                    # [FIX P34] the Gram encodes A[tr], so pass the TRAIN fold's
+                    # row count: the L1 threshold is (n_tr * alpha), not
+                    # (n_full * alpha) -- otherwise the fold fits at ~(K/(K-1))x
+                    # the intended effective alpha.
                     coef = _fista_lasso(A, y64, alpha, x0=x_folds[k],
                                         max_iter=cv_max_iter, tol=cv_tol,
                                         lipschitz=lip_folds[k],
                                         penalty_weights=self.penalty_weights,
-                                        gram=gram_folds[k])
+                                        gram=gram_folds[k],
+                                        n_samples=len(tr))
                     pred = np.asarray(A_va_list[k] @ coef, dtype=np.float64).ravel()
                 else:
                     if A_folds is not None:
