@@ -159,6 +159,13 @@ if [ "$NDATA" -gt "$SM_NDATA" ]; then
   echo "NDATA=$NDATA 超过 disp_matrix.pkl 里的 $SM_NDATA 个构型。" >&2; exit 2
 fi
 
+# [FIX P31] CV 折数不能超过构型数（GroupKFold 按构型分组，NDATA=2/3/4 时 5 折
+# 会每折只有 0-1 个构型做验证）。程序内虽也有 clamp，这里提前夹住并提示。
+if [ "$CV" -gt "$NDATA" ]; then
+  CV=$(( NDATA < 2 ? 2 : NDATA ))
+  echo "CV 折数超过构型数，已夹到 $CV (NDATA=$NDATA)"
+fi
+
 C_FLAG=""
 [ "$C2_CUTOFF" != "None" ] && [ "$C2_CUTOFF" != "none" ] && C_FLAG="$C_FLAG --c2 $C2_CUTOFF"
 [ "$FIT_ORDER" -ge 3 ] && [ "$C3_CUTOFF" != "None" ] && [ "$C3_CUTOFF" != "none" ] && C_FLAG="$C_FLAG --c3 $C3_CUTOFF"

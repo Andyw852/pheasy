@@ -366,11 +366,17 @@ def _estimate_lipschitz(A, power_iters=15):
             break
         v = v / vn
     u = np.asarray(A @ v, dtype=np.float64).ravel()
-    return max(float(np.dot(u, u)), 1e-12)
+    L = max(float(np.dot(u, u)), 1e-12)
+    # [FIX P29] power iteration approaches lambda_max from BELOW, so the bare
+    # estimate under-shoots L and makes step = 1/L too large: FISTA can become
+    # non-monotonic or even diverge when the spectral gap is small.  A small
+    # safety margin keeps the step conservative (override via env if needed).
+    safety = float(os.environ.get("PHEASY_FISTA_LIPSCHITZ_SAFETY", "1.02"))
+    return L * safety
 
 
 def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
-                 lipschitz=None, penalty_weights=None):
+                 lipschitz=None, penalty_weights=None, _info=None):
     """Solve min 0.5||A x - y||^2 + alpha * sum_j w_j |x_j| via FISTA.
 
     [FIX P26] Matvec-only LASSO so LASSO / ALASSO can run on a TwoLevelSM /
@@ -394,6 +400,8 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
         x = np.asarray(x0, dtype=np.float64).copy()
 
     if alpha <= 0:
+        if _info is not None:
+            _info["n_iter"] = 0
         return _solve_sparse_lsqr(A, y64)
 
     if lipschitz is None:
@@ -409,7 +417,9 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
     z = x.copy()          # momentum point y_0 = x_0
     t = 1.0
     x_prev = x.copy()
+    n_iter = 0
     for it in range(int(max_iter)):
+        n_iter = it + 1
         Az = np.asarray(A @ z, dtype=np.float64).ravel()
         grad = np.asarray(A.T @ (Az - y64), dtype=np.float64).ravel()
         x_new = _soft_threshold(z - step * grad, thr)
@@ -432,6 +442,8 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
             if dx <= tol * max(1.0, float(np.linalg.norm(x))):
                 break
             x_prev = x.copy()
+    if _info is not None:
+        _info["n_iter"] = n_iter
     return x
 
 
@@ -451,9 +463,14 @@ def _scale_operator(A, w):
 
 
 def _row_slice_op(A, rows):
-    """LinearOperator for A[rows, :] without materializing A (used by CV folds)."""
+    """LinearOperator for A[rows, :] without materializing A (used by CV folds).
+
+    [FIX P30] buffers are float64 so the FISTA gradient stays in float64 even
+    when the underlying operator is float32 (the matvec itself still follows the
+    operator's dtype, which is PHEASY_SM_DTYPE).
+    """
     n = A.shape[1]
-    dt = A.dtype if hasattr(A, "dtype") else np.dtype(np.float64)
+    dt = np.dtype(np.float64)
     rows = np.asarray(rows, dtype=np.intp)
 
     def mv(v):
@@ -467,6 +484,19 @@ def _row_slice_op(A, rows):
         return np.asarray(A.T @ u_full, dtype=dt).ravel()
 
     return LinearOperator((len(rows), n), matvec=mv, rmatvec=rmv, dtype=dt)
+
+
+def _row_slice(A, rows):
+    """A[rows, :] for dense / sparse / LinearOperator.
+
+    [FIX P30] TwoLevelSM gets a true row-slice (slices SM_prime) so CV-fold
+    matvecs cost O(nnz(SM_prime[rows])) instead of the full O(nnz(SM_prime)).
+    """
+    if hasattr(A, "row_slice"):     # TwoLevelSM
+        return A.row_slice(rows)
+    if _is_linear_operator(A):
+        return _row_slice_op(A, rows)
+    return A[rows]
 
 
 def _ridge_solve(A, y, alpha):
@@ -621,6 +651,15 @@ class TwoLevelSM(LinearOperator):
         """Exact ||SM[:, j]|| (the true sensing-matrix column norms)."""
         return _col_norms(self)
 
+    def row_slice(self, rows):
+        """[FIX P30] TwoLevelSM for A[rows, :] by slicing SM_prime only.
+
+        This is O(nnz(SM_prime[rows])) per matvec instead of the full
+        O(nnz(SM_prime)) that the generic _row_slice_op wrapper pays, so a
+        K-fold CV costs ~1x the full problem rather than ~Kx.
+        """
+        return TwoLevelSM(self.SM_prime[rows], self.NS, dtype=self._dt)
+
     def to_dense(self):
         return _to_dense_f64(self)
 
@@ -763,7 +802,8 @@ class _LassoCVIterative:
         cv_max_iter = min(self.max_iter, 800)
 
         mse_path = np.zeros((n_alphas, len(splits)))
-        x_full = None
+        x_folds = [None] * len(splits)   # [FIX P28] per-fold warm-start
+        x_full = None                    # full-data warm-start for the alpha path
         best_i = 0
         best_mean = float("inf")
         best_x = None
@@ -772,11 +812,16 @@ class _LassoCVIterative:
             alpha = float(self.alphas[a_i])
             fold_mse = np.zeros(len(splits))
             for k, (tr, va) in enumerate(splits):
-                A_tr = _row_slice_op(A, tr) if _is_linear_operator(A) else A[tr]
-                coef = _fista_lasso(A_tr, y64[tr], alpha, x0=x_full,
+                A_tr = _row_slice(A, tr) if _is_linear_operator(A) else A[tr]
+                # [FIX P28] warm-start from THIS fold's previous-alpha solution,
+                # not the full-data solution: with a loose CV budget the warm
+                # start does not fully wash out, so x_full would leak the
+                # validation rows into the fold fit and bias CV low.
+                coef = _fista_lasso(A_tr, y64[tr], alpha, x0=x_folds[k],
                                     max_iter=cv_max_iter, tol=cv_tol,
                                     lipschitz=self._lipschitz,
                                     penalty_weights=self.penalty_weights)
+                x_folds[k] = coef
                 err = _predict_rows(A, coef, va) - y64[va]
                 fold_mse[k] = float(np.mean(err * err))
             mse_path[a_i] = fold_mse
@@ -786,24 +831,42 @@ class _LassoCVIterative:
                                   max_iter=cv_max_iter, tol=cv_tol,
                                   lipschitz=self._lipschitz,
                                   penalty_weights=self.penalty_weights)
-            if mean < best_mean:
+            # [FIX P27] <= (not <) so a tie picks the SMALLEST alpha (the one
+            # seen LAST in the descending walk), matching _reselect_alpha's
+            # tie-break toward the least-regularized member.
+            if mean <= best_mean:
                 best_mean = mean
                 best_i = a_i
                 best_x = x_full.copy()
+
+        # [FIX P27] port _reselect_alpha's tie warning: a flat CV tail means the
+        # loose CV solver did not separate the alphas and the choice is suspect.
+        mean_path = mse_path.mean(axis=1)
+        rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
+        tied = np.flatnonzero(mean_path <= best_mean * (1.0 + rtol) + 1e-300)
+        if tied.size > 1:
+            print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). "
+                  "The CV solver (FISTA, tol=%.0e, %d iters) is too loose to "
+                  "separate them -- lower PHEASY_CV_TOL / raise max_iter."
+                  % (tied.size, best_mean, float(self.alphas[tied].min()),
+                     float(self.alphas[tied].max()), cv_tol, cv_max_iter),
+                  flush=True)
 
         self.alpha_ = float(self.alphas[best_i])
         # final refit at the chosen alpha, warm-started from the path. Cap the
         # iteration budget (FISTA is O(1/k^2), and the scaled ALASSO matrix is
         # more ill-conditioned); 5000 warm-started steps already reach ~1e-5.
+        _finfo = {"n_iter": 0}
         self.coef_ = _fista_lasso(A, y64, self.alpha_, x0=best_x,
                                   max_iter=min(self.max_iter, 5000),
                                   tol=max(float(self.tol), 1e-7),
                                   lipschitz=self._lipschitz,
-                                  penalty_weights=self.penalty_weights)
+                                  penalty_weights=self.penalty_weights,
+                                  _info=_finfo)
         self.intercept_ = 0.0
         self.alphas_ = self.alphas
         self.mse_path_ = mse_path
-        self.n_iter_ = self.max_iter
+        self.n_iter_ = int(_finfo.get("n_iter", 0))
         self.n_features_in_ = A.shape[1]
         return self
 
@@ -1295,7 +1358,7 @@ class Optimizer(object):
                 for a in self._alpha:
                     mse = 0.0
                     for tr, va in splits:
-                        c = _ridge_solve(_row_slice_op(A_fit, tr), F64[tr], a)
+                        c = _ridge_solve(_row_slice(A_fit, tr), F64[tr], a)
                         mse += float(np.mean((_predict_rows(A_fit, c, va) - F64[va]) ** 2))
                     mse /= len(splits)
                     if mse < best_mse:
