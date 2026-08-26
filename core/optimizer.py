@@ -744,6 +744,12 @@ class _LassoCVIterative:
 
     def fit(self, A, y, sample_weight=None):
         y64 = np.asarray(y, dtype=np.float64).ravel()
+        if sample_weight is not None and not np.allclose(sample_weight, sample_weight[0]):
+            # [FIX P26] the matvec-only FISTA path does not yet support weighted
+            # data; the dense sklearn path does.  sample_weight is always None in
+            # the pheasy CLI, so this only guards direct Optimizer API use.
+            print("[optimizer] WARNING: iterative LASSO ignores non-uniform "
+                  "sample_weight (dense path supports it).", flush=True)
         splits = _make_cv_splits(A.shape[0], self.cv, self.rand_seed,
                                  self.group_size)
         n_alphas = len(self.alphas)
