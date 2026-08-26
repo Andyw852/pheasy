@@ -1,13 +1,23 @@
 *.bak*
 __pycache__/
-
-# local verification data and download staging
-MnIn2Se4_lasso/
-.staging/
-
-# c3=7.0 扫描数据 (大文件, 不入库)
-MnIn2Se4_c7/
 *.egg-info/
 
-# c3=7.0 扫描结果缓存 (phi_*.npz)
+# download staging / scan result cache (regenerated, not committed)
+.staging/
 .scan_results/
+
+# 拟合脚本在测试材料目录里运行时生成的中间缓存（不入库）
+test/*/.pheasy_stamp*
+test/*/dim_detected.txt
+test/*/sm_prime.npz
+test/*/ns_*.npz
+test/*/cs.pkl
+test/*/neighbor_list.pkl
+test/*/fm1d.npz
+test/*/sm_dense.npy*
+test/*/fc2.hdf5
+test/*/fc3.hdf5
+test/*/fc4.hdf5
+test/*/FORCE_CONSTANTS
+test/*/FORCE_CONSTANTS_3RD
+test/*/FORCE_CONSTANTS_4TH
