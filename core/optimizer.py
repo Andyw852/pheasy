@@ -370,14 +370,20 @@ def _estimate_lipschitz(A, power_iters=15):
 
 
 def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
-                 lipschitz=None):
-    """Solve min 0.5||A x - y||^2 + alpha||x||_1 via FISTA (matvec/rmatvec only).
+                 lipschitz=None, penalty_weights=None):
+    """Solve min 0.5||A x - y||^2 + alpha * sum_j w_j |x_j| via FISTA.
 
     [FIX P26] Matvec-only LASSO so LASSO / ALASSO can run on a TwoLevelSM /
     LinearOperator and on genuinely-huge sparse matrices without ever
     building the dense sensing matrix; peak memory is ~O(n_features).
     Warm-started from x0 when given (the alpha path is warm-started from
     the previous alpha).
+
+    penalty_weights (w_j) implements the adaptive-LASSO penalty directly in
+    the ORIGINAL column space (per-coordinate soft-threshold) instead of
+    column-scaling A by 1/w. That keeps the Lipschitz constant at ||A||^2
+    rather than ||A / w||^2, so the ALASSO adaptive scaling no longer slows
+    FISTA down.
     """
     n = A.shape[1]
     n_samples = A.shape[0]
@@ -397,6 +403,8 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
     # which equals 0.5||Ax-y||^2 + (n_samples*alpha)||x||_1 -- so the L1 weight
     # in the proximal step is scaled by n_samples to match the alpha grid.
     thr = float(alpha) * n_samples * step
+    if penalty_weights is not None:
+        thr = thr * np.asarray(penalty_weights, dtype=np.float64).ravel()
 
     z = x.copy()          # momentum point y_0 = x_0
     t = 1.0
@@ -406,9 +414,17 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
         grad = np.asarray(A.T @ (Az - y64), dtype=np.float64).ravel()
         x_new = _soft_threshold(z - step * grad, thr)
 
-        t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
-        z = x_new + ((t - 1.0) / t_new) * (x_new - x)
-        t = t_new
+        # FISTA with adaptive restart (O'Donoghue & Candes 2015): reset the
+        # momentum when it points against the last step, which restores (near)
+        # linear convergence on ill-conditioned problems like the ALASSO
+        # adaptive-scaled matrix.
+        if float(np.dot(z - x_new, x_new - x)) > 0.0:
+            z = x_new
+            t = 1.0
+        else:
+            t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
+            z = x_new + ((t - 1.0) / t_new) * (x_new - x)
+            t = t_new
         x = x_new
 
         if it % 20 == 19:
@@ -712,7 +728,8 @@ class _LassoCVIterative:
     ~O(n_features). The alpha path is walked large->small and warm-started.
     """
     def __init__(self, alphas, cv, tol, max_iter, rand_seed, n_jobs=1,
-                 fit_intercept=False, group_size=None, selection="cyclic"):
+                 fit_intercept=False, group_size=None, selection="cyclic",
+                 penalty_weights=None):
         self.alphas = np.asarray(alphas, dtype=np.float64)
         self.cv = cv
         self.tol = tol
@@ -722,6 +739,7 @@ class _LassoCVIterative:
         self.fit_intercept = fit_intercept
         self.group_size = group_size
         self.selection = selection
+        self.penalty_weights = penalty_weights
         self._lipschitz = None
 
     def fit(self, A, y, sample_weight=None):
@@ -731,11 +749,18 @@ class _LassoCVIterative:
         n_alphas = len(self.alphas)
         self._lipschitz = _estimate_lipschitz(A)
 
+        # CV folds only need to RANK the alphas, so a loose tolerance and a low
+        # iteration budget suffice; the final refit uses the caller's tight tol.
+        # This keeps the iterative path tractable on large systems (the dense
+        # sklearn path is unaffected).
+        cv_tol = max(float(self.tol), 1e-3)
+        cv_max_iter = min(self.max_iter, 800)
+
         mse_path = np.zeros((n_alphas, len(splits)))
         x_full = None
         best_i = 0
         best_mean = float("inf")
-        best_coef = None
+        best_x = None
 
         for a_i in range(n_alphas - 1, -1, -1):  # descending: large alpha first
             alpha = float(self.alphas[a_i])
@@ -743,23 +768,32 @@ class _LassoCVIterative:
             for k, (tr, va) in enumerate(splits):
                 A_tr = _row_slice_op(A, tr) if _is_linear_operator(A) else A[tr]
                 coef = _fista_lasso(A_tr, y64[tr], alpha, x0=x_full,
-                                    max_iter=self.max_iter, tol=self.tol,
-                                    lipschitz=self._lipschitz)
+                                    max_iter=cv_max_iter, tol=cv_tol,
+                                    lipschitz=self._lipschitz,
+                                    penalty_weights=self.penalty_weights)
                 err = _predict_rows(A, coef, va) - y64[va]
                 fold_mse[k] = float(np.mean(err * err))
             mse_path[a_i] = fold_mse
             mean = float(fold_mse.mean())
             # warm-start the next (smaller) alpha from this alpha's full fit
             x_full = _fista_lasso(A, y64, alpha, x0=x_full,
-                                  max_iter=self.max_iter, tol=self.tol,
-                                  lipschitz=self._lipschitz)
+                                  max_iter=cv_max_iter, tol=cv_tol,
+                                  lipschitz=self._lipschitz,
+                                  penalty_weights=self.penalty_weights)
             if mean < best_mean:
                 best_mean = mean
                 best_i = a_i
-                best_coef = x_full.copy()
+                best_x = x_full.copy()
 
         self.alpha_ = float(self.alphas[best_i])
-        self.coef_ = best_coef
+        # final refit at the chosen alpha, warm-started from the path. Cap the
+        # iteration budget (FISTA is O(1/k^2), and the scaled ALASSO matrix is
+        # more ill-conditioned); 5000 warm-started steps already reach ~1e-5.
+        self.coef_ = _fista_lasso(A, y64, self.alpha_, x0=best_x,
+                                  max_iter=min(self.max_iter, 5000),
+                                  tol=max(float(self.tol), 1e-7),
+                                  lipschitz=self._lipschitz,
+                                  penalty_weights=self.penalty_weights)
         self.intercept_ = 0.0
         self.alphas_ = self.alphas
         self.mse_path_ = mse_path
@@ -860,16 +894,21 @@ class _AdaptiveLassoCV(_LassoCVModel):
         n_samples = A.shape[0]
         beta0 = self._initial_estimate(A, y)
         self._weights = 1.0 / (np.abs(beta0) + self.eps) ** self.gamma
-        A_scaled = _scale_columns(A, self._weights)
 
-        if _lasso_backend(A_scaled) == "iterative":
+        if _lasso_backend(A) == "iterative":
+            # [FIX P26] penalized form: pass per-coordinate weights w_j and
+            # fit on the ORIGINAL columns (no column-scaling), so the FISTA
+            # Lipschitz stays ||A||^2 and convergence is as fast as plain
+            # LASSO. Column-scaling by 1/w would inflate the Lipschitz to
+            # ||A / w||^2 and make FISTA crawl on the ill-conditioned matrix.
             it = _LassoCVIterative(
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
                 self.n_jobs, fit_intercept=self.fit_intercept,
-                group_size=self.group_size, selection=self.selection)
-            it.fit(A_scaled, y, sample_weight=sample_weight)
+                group_size=self.group_size, selection=self.selection,
+                penalty_weights=self._weights)
+            it.fit(A, y, sample_weight=sample_weight)
             self.model_ = it
-            self.coef_ = it.coef_ / self._weights
+            self.coef_ = it.coef_
             self.intercept_ = it.intercept_ if self.fit_intercept else 0.0
             self.alpha_ = it.alpha_
             self.alphas_ = it.alphas_
@@ -878,6 +917,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
             self.n_features_in_ = A.shape[1]
             return self
 
+        A_scaled = _scale_columns(A, self._weights)
         splits = _make_cv_splits(n_samples, self.cv, self.rand_seed, self.group_size)
         model = LassoCV(
             alphas=self.alphas,
@@ -1312,7 +1352,10 @@ class Optimizer(object):
             self._metrics["n_features"] = self._model.n_features_in_
             self._metrics["n_featrues"] = self._metrics["n_features"]  # [FIX P12] deprecated alias
         elif method == "RIDGE":
-            self._results["alpha"] = float(self._model.alpha_)
+            # [FIX P26] the operator path stores a plain _OLSModel (no alpha_),
+            # so fall back to the alpha already recorded during the ridge CV.
+            self._results["alpha"] = float(getattr(
+                self._model, "alpha_", self._results.get("alpha", 0.0)))
         elif method == "OLS":
             self._results["n_iter"] = getattr(self._model, "n_iter_", None)
 
