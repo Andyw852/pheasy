@@ -951,12 +951,19 @@ class WorkFlow(object):
                     _ols_twolevel = _os_p.environ.get('PHEASY_OLS_TWOLEVEL','1').lower() in ('1','true','yes')
                     # [PATCH rfe-twolevel] RFE 也可走两级 matvec (PHEASY_RFE_TWOLEVEL=1)
                     _rfe_twolevel = _os_p.environ.get('PHEASY_RFE_TWOLEVEL','0').lower() in ('1','true','yes')
-                    _twolevel = (_is_ols and _ols_twolevel) or (_is_rfe and _rfe_twolevel)
+                    # [PATCH lasso-twolevel] LASSO/ALASSO/RIDGE 也可走两级 matvec
+                    # (PHEASY_LASSO_TWOLEVEL=1)。默认关: 两级 matvec 每次是两次稀疏乘,
+                    # 仅当稀疏乘积 SM 本身也放不下内存时才划算。
+                    _is_lasso_family = (settings.MODEL.upper() in ('LASSO', 'ALASSO', 'RIDGE'))
+                    _lasso_twolevel = _os_p.environ.get('PHEASY_LASSO_TWOLEVEL','0').lower() in ('1','true','yes')
+                    _twolevel = ((_is_ols and _ols_twolevel)
+                                 or (_is_rfe and _rfe_twolevel)
+                                 or (_is_lasso_family and _lasso_twolevel))
                     _use_sparse = (
                         (not _is_rfe_tsqr)
                         and (
                             (_is_rfe and _rfe_sparse)
-                            or (_lasso_sparse and not _is_rfe)
+                            or (_is_lasso_family and (_lasso_sparse or _lasso_twolevel))
                             or (_is_ols and _ols_twolevel)
                         )
                     )
@@ -975,7 +982,7 @@ class WorkFlow(object):
                         if _twolevel:
                             # [PATCH ols/rfe-twolevel] 不显式相乘, 包成 TwoLevelSM.
                             # 关键: 不 del SM_prime/_ns_sp, TwoLevelSM 要持有引用.
-                            _tl_who = "OLS" if _is_ols else "RFE"
+                            _tl_who = "OLS" if _is_ols else ("RFE" if _is_rfe else _model_up)
                             from pheasy.core.optimizer import TwoLevelSM as _TwoLevelSM
                             # MKL matvec 要求 CSR/CSC (非 COO); NS_full 常为 COO -> 转 CSR.
                             if (not _sp_p.issparse(_ns_sp)) or _ns_sp.format not in ('csr','csc'):
