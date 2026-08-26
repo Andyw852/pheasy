@@ -150,16 +150,56 @@ def _solve_sparse_lsqr(A, y):
     return np.asarray(res[0], dtype=np.float64)
 
 
+def _available_memory_bytes():
+    """Available physical RAM in bytes (None if undetectable).
+
+    [FIX P26] Reads the OS's available-memory estimate (not total) so the
+    dense/iterative dispatch reflects what the node can actually hand out right
+    now, not just a fixed element budget.
+    """
+    try:
+        return int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
 def _should_densify_sparse(A):
     """True when densifying a sparse matrix is cheap enough (memory budget).
 
     A sparse container that is actually 100% dense (e.g. SM = SM_prime @ NS for
     small systems) is densified so the faster SVD/QR solvers run; genuinely
     sparse / huge matrices stay sparse and use the iterative LSQR solver.
+
+    [FIX P26] now memory-aware: besides the PHEASY_MAX_DENSE element cap, the
+    float64 footprint must fit in PHEASY_SOLVER_MEM_FRACTION of the available
+    RAM (default 0.25). This keeps a large system on the iterative path even
+    when its element count is small on paper but the node is already loaded.
     """
     n, m = A.shape
     max_dense = int(os.environ.get("PHEASY_MAX_DENSE", "200000000"))
-    return (n * m) <= max_dense
+    if (n * m) > max_dense:
+        return False
+    avail = _available_memory_bytes()
+    if avail is not None:
+        frac = float(os.environ.get("PHEASY_SOLVER_MEM_FRACTION", "0.25"))
+        if (n * m * 8) > avail * frac:
+            return False
+    return True
+
+
+def _lasso_backend(A):
+    """Choose the LASSO/ALASSO backend: "dense" (sklearn) or "iterative" (FISTA).
+
+    sklearn's LassoCV / RidgeCV only accept a materialized array, so any
+    LinearOperator -- and any sparse matrix too big to densify -- must go
+    through the matvec-only FISTA solver instead. This is the same dispatch
+    policy _solve_lstsq already uses for OLS.
+    """
+    if _is_linear_operator(A):
+        return "iterative"
+    if sp.issparse(A) and not _should_densify_sparse(A):
+        return "iterative"
+    return "dense"
 
 
 def _solve_lstsq(A, y, driver="gelsd"):
@@ -300,6 +340,152 @@ def _make_masked_op(A, row_idx, col_idx):
         return np.asarray(A.T @ u_full).ravel()[col_idx]
 
     return LinearOperator((n_rows, n_cols), matvec=mv, rmatvec=rmv, dtype=dt)
+
+
+def _soft_threshold(x, thr):
+    """Elementwise soft-thresholding: sign(x) * max(|x| - thr, 0)."""
+    x = np.asarray(x)
+    return np.sign(x) * np.maximum(np.abs(x) - thr, 0.0)
+
+
+def _estimate_lipschitz(A, power_iters=15):
+    """Estimate L = ||A||_2^2 (top eigenvalue of A^T A) by power iteration.
+
+    Only needs matvec/rmatvec, so it works for dense, sparse and
+    LinearOperator (TwoLevelSM) alike. L is the Lipschitz constant of the
+    LASSO smooth part.
+    """
+    n = A.shape[1]
+    v = np.random.RandomState(0).randn(n)
+    v = v / (np.linalg.norm(v) + 1e-300)
+    for _ in range(power_iters):
+        u = np.asarray(A @ v, dtype=np.float64).ravel()
+        v = np.asarray(A.T @ u, dtype=np.float64).ravel()
+        vn = np.linalg.norm(v)
+        if vn < 1e-30:
+            break
+        v = v / vn
+    u = np.asarray(A @ v, dtype=np.float64).ravel()
+    return max(float(np.dot(u, u)), 1e-12)
+
+
+def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
+                 lipschitz=None):
+    """Solve min 0.5||A x - y||^2 + alpha||x||_1 via FISTA (matvec/rmatvec only).
+
+    [FIX P26] Matvec-only LASSO so LASSO / ALASSO can run on a TwoLevelSM /
+    LinearOperator and on genuinely-huge sparse matrices without ever
+    building the dense sensing matrix; peak memory is ~O(n_features).
+    Warm-started from x0 when given (the alpha path is warm-started from
+    the previous alpha).
+    """
+    n = A.shape[1]
+    n_samples = A.shape[0]
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    if x0 is None:
+        x = np.zeros(n, dtype=np.float64)
+    else:
+        x = np.asarray(x0, dtype=np.float64).copy()
+
+    if alpha <= 0:
+        return _solve_sparse_lsqr(A, y64)
+
+    if lipschitz is None:
+        lipschitz = _estimate_lipschitz(A)
+    step = 1.0 / max(float(lipschitz), 1e-12)
+    # sklearn LassoCV convention is (1/(2 n_samples))||Ax-y||^2 + alpha||x||_1,
+    # which equals 0.5||Ax-y||^2 + (n_samples*alpha)||x||_1 -- so the L1 weight
+    # in the proximal step is scaled by n_samples to match the alpha grid.
+    thr = float(alpha) * n_samples * step
+
+    z = x.copy()          # momentum point y_0 = x_0
+    t = 1.0
+    x_prev = x.copy()
+    for it in range(int(max_iter)):
+        Az = np.asarray(A @ z, dtype=np.float64).ravel()
+        grad = np.asarray(A.T @ (Az - y64), dtype=np.float64).ravel()
+        x_new = _soft_threshold(z - step * grad, thr)
+
+        t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
+        z = x_new + ((t - 1.0) / t_new) * (x_new - x)
+        t = t_new
+        x = x_new
+
+        if it % 20 == 19:
+            dx = float(np.linalg.norm(x - x_prev))
+            if dx <= tol * max(1.0, float(np.linalg.norm(x))):
+                break
+            x_prev = x.copy()
+    return x
+
+
+def _scale_operator(A, w):
+    """LinearOperator for the column-scaled A[:, j] / w[j], no materialization."""
+    inv_w = (1.0 / np.asarray(w, dtype=np.float64)).ravel()
+
+    def mv(v):
+        v = np.asarray(v, dtype=np.float64).ravel()
+        return np.asarray(A @ (v * inv_w), dtype=np.float64).ravel()
+
+    def rmv(u):
+        u = np.asarray(u, dtype=np.float64).ravel()
+        return (np.asarray(A.T @ u, dtype=np.float64).ravel()) * inv_w
+
+    return LinearOperator(A.shape, matvec=mv, rmatvec=rmv, dtype=np.float64)
+
+
+def _row_slice_op(A, rows):
+    """LinearOperator for A[rows, :] without materializing A (used by CV folds)."""
+    n = A.shape[1]
+    dt = A.dtype if hasattr(A, "dtype") else np.dtype(np.float64)
+    rows = np.asarray(rows, dtype=np.intp)
+
+    def mv(v):
+        v = np.asarray(v, dtype=dt).ravel()
+        return np.asarray(A @ v, dtype=dt).ravel()[rows]
+
+    def rmv(u):
+        u = np.asarray(u, dtype=dt).ravel()
+        u_full = np.zeros(A.shape[0], dtype=dt)
+        u_full[rows] = u
+        return np.asarray(A.T @ u_full, dtype=dt).ravel()
+
+    return LinearOperator((len(rows), n), matvec=mv, rmatvec=rmv, dtype=dt)
+
+
+def _ridge_solve(A, y, alpha):
+    """min ||A x - y||^2 + alpha||x||^2 for dense / sparse / LinearOperator."""
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    if _is_linear_operator(A):
+        n = A.shape[1]
+        sqrt_a = float(np.sqrt(alpha)) if alpha > 0 else 0.0
+        if sqrt_a > 0:
+            def mv_aug(v):
+                v = np.asarray(v, dtype=np.float64).ravel()
+                return np.concatenate(
+                    [np.asarray(A @ v, dtype=np.float64).ravel(), sqrt_a * v])
+
+            def rmv_aug(u):
+                u = np.asarray(u, dtype=np.float64).ravel()
+                return (np.asarray(A.T @ u[: A.shape[0]], dtype=np.float64).ravel()
+                        + sqrt_a * u[A.shape[0]:])
+
+            op = LinearOperator((A.shape[0] + n, n), matvec=mv_aug,
+                                rmatvec=rmv_aug, dtype=np.float64)
+            y_aug = np.concatenate([y64, np.zeros(n)])
+        else:
+            op, y_aug = A, y64
+        atol = float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8"))
+        btol = float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8"))
+        maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
+        res = _lsmr(op, y_aug, atol=atol, btol=btol, maxiter=maxiter)
+        return np.asarray(res[0], dtype=np.float64)
+    if alpha > 0:
+        ridge = Ridge(alpha=alpha, fit_intercept=False, solver="auto")
+        ridge.fit(A, y64)
+        return ridge.coef_
+    return _solve_lstsq(A, y64)
+
 
 
 def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
@@ -512,6 +698,81 @@ def _lasso_n_jobs(A):
     return max(1, min(n, cap, 16))
 
 
+def _predict_rows(A, coef, rows):
+    """A[rows] @ coef for dense / sparse / LinearOperator (one matvec)."""
+    return np.asarray(A @ coef, dtype=np.float64).ravel()[rows]
+
+
+class _LassoCVIterative:
+    """LASSO over an alpha grid with grouped CV via the matvec-only FISTA solver.
+
+    [FIX P26] Drop-in for _LassoCVModel when the design matrix is a
+    LinearOperator or a sparse matrix too large to densify (see
+    _lasso_backend). Never materializes the sensing matrix; peak memory is
+    ~O(n_features). The alpha path is walked large->small and warm-started.
+    """
+    def __init__(self, alphas, cv, tol, max_iter, rand_seed, n_jobs=1,
+                 fit_intercept=False, group_size=None, selection="cyclic"):
+        self.alphas = np.asarray(alphas, dtype=np.float64)
+        self.cv = cv
+        self.tol = tol
+        self.max_iter = int(max_iter)
+        self.rand_seed = rand_seed
+        self.n_jobs = int(n_jobs)
+        self.fit_intercept = fit_intercept
+        self.group_size = group_size
+        self.selection = selection
+        self._lipschitz = None
+
+    def fit(self, A, y, sample_weight=None):
+        y64 = np.asarray(y, dtype=np.float64).ravel()
+        splits = _make_cv_splits(A.shape[0], self.cv, self.rand_seed,
+                                 self.group_size)
+        n_alphas = len(self.alphas)
+        self._lipschitz = _estimate_lipschitz(A)
+
+        mse_path = np.zeros((n_alphas, len(splits)))
+        x_full = None
+        best_i = 0
+        best_mean = float("inf")
+        best_coef = None
+
+        for a_i in range(n_alphas - 1, -1, -1):  # descending: large alpha first
+            alpha = float(self.alphas[a_i])
+            fold_mse = np.zeros(len(splits))
+            for k, (tr, va) in enumerate(splits):
+                A_tr = _row_slice_op(A, tr) if _is_linear_operator(A) else A[tr]
+                coef = _fista_lasso(A_tr, y64[tr], alpha, x0=x_full,
+                                    max_iter=self.max_iter, tol=self.tol,
+                                    lipschitz=self._lipschitz)
+                err = _predict_rows(A, coef, va) - y64[va]
+                fold_mse[k] = float(np.mean(err * err))
+            mse_path[a_i] = fold_mse
+            mean = float(fold_mse.mean())
+            # warm-start the next (smaller) alpha from this alpha's full fit
+            x_full = _fista_lasso(A, y64, alpha, x0=x_full,
+                                  max_iter=self.max_iter, tol=self.tol,
+                                  lipschitz=self._lipschitz)
+            if mean < best_mean:
+                best_mean = mean
+                best_i = a_i
+                best_coef = x_full.copy()
+
+        self.alpha_ = float(self.alphas[best_i])
+        self.coef_ = best_coef
+        self.intercept_ = 0.0
+        self.alphas_ = self.alphas
+        self.mse_path_ = mse_path
+        self.n_iter_ = self.max_iter
+        self.n_features_in_ = A.shape[1]
+        return self
+
+    def predict(self, A):
+        pred = np.asarray(A @ self.coef_).ravel()
+        if self.fit_intercept:
+            pred = pred + self.intercept_
+        return pred
+
 class _LassoCVModel:
     """Thin wrapper around sklearn LassoCV with correct alpha grid and grouped CV."""
 
@@ -528,6 +789,22 @@ class _LassoCVModel:
         self.selection = selection
 
     def fit(self, A, y, sample_weight=None):
+        if _lasso_backend(A) == "iterative":
+            it = _LassoCVIterative(
+                self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
+                self.n_jobs, fit_intercept=self.fit_intercept,
+                group_size=self.group_size, selection=self.selection)
+            it.fit(A, y, sample_weight=sample_weight)
+            self.model_ = it
+            self.coef_ = it.coef_
+            self.intercept_ = it.intercept_
+            self.alpha_ = it.alpha_
+            self.alphas_ = it.alphas_
+            self.mse_path_ = it.mse_path_
+            self.n_iter_ = it.n_iter_
+            self.n_features_in_ = it.n_features_in_
+            return self
+
         n_samples = A.shape[0]
         splits = _make_cv_splits(n_samples, self.cv, self.rand_seed, self.group_size)
         model = LassoCV(
@@ -574,21 +851,33 @@ class _AdaptiveLassoCV(_LassoCVModel):
         self._weights = None
 
     def _initial_estimate(self, A, y):
-        # [FIX P25] solver="auto" picks cholesky/svd for dense and sparse_cg
-        # for sparse (both without densifying).  The previous "lsqr" is
-        # iterative and on a DENSE underdetermined design matrix spends ~10 min
-        # in scipy's lsqr where LAPACK svd needs seconds -- same ridge solution.
-        y64 = np.asarray(y, dtype=np.float64).ravel()
-        ridge = Ridge(alpha=self.init_alpha, fit_intercept=self.fit_intercept,
-                      solver="auto")
-        ridge.fit(A, y64)
-        return ridge.coef_
+        # [FIX P26] _ridge_solve handles dense / sparse / LinearOperator, so the
+        # adaptive weights are available on the two-level operator too (LSMR on
+        # the augmented system for operators, cholesky/svd for dense).
+        return _ridge_solve(A, y, self.init_alpha)
 
     def fit(self, A, y, sample_weight=None):
         n_samples = A.shape[0]
         beta0 = self._initial_estimate(A, y)
         self._weights = 1.0 / (np.abs(beta0) + self.eps) ** self.gamma
         A_scaled = _scale_columns(A, self._weights)
+
+        if _lasso_backend(A_scaled) == "iterative":
+            it = _LassoCVIterative(
+                self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
+                self.n_jobs, fit_intercept=self.fit_intercept,
+                group_size=self.group_size, selection=self.selection)
+            it.fit(A_scaled, y, sample_weight=sample_weight)
+            self.model_ = it
+            self.coef_ = it.coef_ / self._weights
+            self.intercept_ = it.intercept_ if self.fit_intercept else 0.0
+            self.alpha_ = it.alpha_
+            self.alphas_ = it.alphas_
+            self.mse_path_ = it.mse_path_
+            self.n_iter_ = it.n_iter_
+            self.n_features_in_ = A.shape[1]
+            return self
+
         splits = _make_cv_splits(n_samples, self.cv, self.rand_seed, self.group_size)
         model = LassoCV(
             alphas=self.alphas,
@@ -622,28 +911,19 @@ class _AdaptiveLassoCV(_LassoCVModel):
 def _scale_columns(A, w):
     """Column-scaled copy of A: A[:, j] / w[j] (dense or sparse).
 
-    [FIX P07] A LinearOperator (e.g. TwoLevelSM) has no columns to scale, so it
-    must be materialized -- sklearn's coordinate descent cannot consume an
-    operator anyway.  The old code did that silently via ``A @ np.eye(n)``,
-    which quietly undoes the whole two-level memory optimization and OOM-kills
-    the job on large cutoffs.  Now we say so, and refuse above a budget.
+    [FIX P26] A LinearOperator (e.g. TwoLevelSM) is wrapped by _scale_operator
+    instead of being materialized, so LASSO / ALASSO can run the matvec-only
+    FISTA solver and keep the two-level memory optimization (sklearn's
+    coordinate descent cannot consume an operator, so _LassoCVModel routes
+    it to the iterative backend).
     """
     inv_w = 1.0 / np.asarray(w, dtype=np.float64)
     if sp.issparse(A):
         return A.astype(np.float64).multiply(inv_w[None, :]).tocsr()
     if _is_linear_operator(A):
-        need = float(A.shape[0]) * float(A.shape[1]) * 8.0
-        budget = float(os.environ.get("PHEASY_MAX_DENSE_GB", "16")) * 1e9
-        msg = ("--std / LASSO / ALASSO / RIDGE need a materialized design "
-               "matrix, so the two-level operator %s must be densified "
-               "(%.1f GB in float64)." % (str(A.shape), need / 1e9))
-        if need > budget:
-            raise MemoryError(
-                msg + " That exceeds PHEASY_MAX_DENSE_GB=%.1f GB. Use -l OLS or "
-                "-l RFE (which stream the operator), drop --std, or raise "
-                "PHEASY_MAX_DENSE_GB if you really have the RAM."
-                % (budget / 1e9))
-        print("[optimizer] WARNING: " + msg, flush=True)
+        # [FIX P26] wrap instead of materializing, so LASSO/ALASSO run the
+        # matvec-only FISTA solver and keep the two-level memory optimization.
+        return _scale_operator(A, w)
     A64 = _to_dense_f64(A)
     # A[:, j] * (1/w[j]) == A[:, j] / w[j]
     return A64 * inv_w[None, :]
@@ -959,9 +1239,29 @@ class Optimizer(object):
             self._model.fit(A, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "RIDGE":
-            self._model = RidgeCV(alphas=self._alpha, fit_intercept=self._fit_intercept)
-            self._model.fit(A_fit, F64, sample_weight=weights)
-            coef = self._model.coef_
+            if _is_linear_operator(A_fit):
+                # [FIX P26] ridge CV over the alpha grid on the two-level
+                # operator via _ridge_solve (LSMR on the augmented system).
+                splits = _make_cv_splits(A.shape[0], self._cv, self._rand_seed,
+                                         self._group_size)
+                best_alpha = float(self._alpha[0])
+                best_mse = float("inf")
+                for a in self._alpha:
+                    mse = 0.0
+                    for tr, va in splits:
+                        c = _ridge_solve(_row_slice_op(A_fit, tr), F64[tr], a)
+                        mse += float(np.mean((_predict_rows(A_fit, c, va) - F64[va]) ** 2))
+                    mse /= len(splits)
+                    if mse < best_mse:
+                        best_mse = mse
+                        best_alpha = float(a)
+                coef = _ridge_solve(A_fit, F64, best_alpha)
+                self._model = _OLSModel(coef)
+                self._results["alpha"] = best_alpha
+            else:
+                self._model = RidgeCV(alphas=self._alpha, fit_intercept=self._fit_intercept)
+                self._model.fit(A_fit, F64, sample_weight=weights)
+                coef = self._model.coef_
         else:
             raise ValueError(
                 "Unknown linear model for fitting force constants: {} ".format(self._method)
@@ -1053,14 +1353,17 @@ class Optimizer(object):
         if not (0 < sup.size < coef.size):
             return coef
         if _is_linear_operator(A):
-            # [FIX P08] no cheap column slicing for a LinearOperator. Skipping
-            # debias silently is dangerous: the L1 shrinkage bias is exactly
-            # what makes LASSO force constants come out ~10% too small.
-            print("[optimizer] WARNING: LASSO debias skipped -- the design "
-                  "matrix is a LinearOperator and cannot be column-sliced. "
-                  "The returned force constants still carry the L1 shrinkage "
-                  "bias. Set PHEASY_OLS_TWOLEVEL=0 / PHEASY_LASSO_SPARSE=0 to "
-                  "get a sliceable matrix.", flush=True)
+            # [FIX P26] column-slice via a masked operator + LSMR, so the
+            # relaxed-LASSO debias is no longer skipped on the two-level
+            # operator (the L1 shrinkage bias is removed there too).
+            op = _make_masked_op(A, None, sup)
+            coef_sub = _solve_sparse_lsqr(op, y)
+            new = np.zeros_like(coef)
+            new[sup] = coef_sub
+            r_new = float(np.linalg.norm(np.asarray(A @ new).ravel() - y))
+            r_old = float(np.linalg.norm(np.asarray(A @ coef).ravel() - y))
+            if r_new <= r_old:
+                return new
             return coef
         A_sub = A[:, sup]
         coef_sub = _solve_lstsq(A_sub, y)
