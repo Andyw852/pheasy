@@ -239,7 +239,17 @@ def _tsqr_qless(A, y, block_rows=40000, diag_floor=1e-12):
     # the tree reduction accumulates to full rank). Letting the user pick a
     # small block_rows shrinks the block densification buffer from
     # block_rows*n*8 to blk*n*8 (e.g. cutoff 5.5: 21 GB -> 1.7 GB at blk=4000).
-    block_rows = max(int(block_rows), 1)
+    # [FIX P36c] block-height guardrail: below ~n/4 the QR-call overhead grows
+    # without any memory savings (the final n^2 R dominates the peak), so clamp
+    # the effective height to at least min(n, 2048) and say so.  Correctness is
+    # unaffected -- this only keeps users out of the counterproductive range.
+    _blk = int(block_rows) if block_rows else 0
+    _floor = min(n, 2048)
+    if 0 < _blk < _floor and _blk < n // 4:
+        print("[optimizer] WARNING: TSQR block_rows=%d << n=%d; effective height "
+              "raised to %d (tiny blocks add QR-call overhead, not memory "
+              "savings)." % (_blk, n, _floor), flush=True)
+    block_rows = max(_blk, _floor)
 
     # ---- level 0: independent QR of each block --------------------------------
     # [FIX P36] streaming binary-tree TSQR: merge same-level R factors on the
