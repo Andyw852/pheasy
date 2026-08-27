@@ -1138,7 +1138,19 @@ class WorkFlow(object):
             # Auto-derive the LASSO/ALASSO alpha grid from the data (default),
             # so the shell script no longer needs the derive_alpha_grid logic.
             alpha_kwargs = {}
-            if settings.MODEL.upper() in ("LASSO", "ALASSO") and settings.ALPHA_AUTO:
+            # [FIX P39] ALASSO's weighted-space grid (P37/P38) derives its own
+            # grid inside _AdaptiveLassoCV.fit and would throw away this
+            # unweighted derive_alpha_grid (whose A.T@y is a wasted rmatvec).
+            # Derive only for LASSO and for the ALASSO mu_shift fallback
+            # (PHEASY_ALASSO_WEIGHTED_GRID=0); the weighted ALASSO path skips
+            # this and lets _AdaptiveLassoCV do its single dtype-aware rmatvec.
+            _alasso_weighted = (
+                settings.MODEL.upper() == "ALASSO"
+                and os.environ.get("PHEASY_ALASSO_WEIGHTED_GRID", "1").lower()
+                in ("1", "true", "yes"))
+            if settings.ALPHA_AUTO and (
+                    settings.MODEL.upper() == "LASSO"
+                    or (settings.MODEL.upper() == "ALASSO" and not _alasso_weighted)):
                 try:
                     from pheasy.core.optimizer import derive_alpha_grid as _derive_alpha
                     _shift = 0.0
@@ -1175,6 +1187,11 @@ class WorkFlow(object):
                 # weighted-space grid is only derived when the user asked for
                 # auto grids; --mu_min/--mu_max grids are respected as given.
                 alpha_auto=settings.ALPHA_AUTO,
+                # [FIX P39] --alpha_decades must reach the ALASSO weighted grid
+                # (it controls both the span and, via P38, the point density);
+                # the old Optimizer hard-coded env/4.0 and ignored this CLI flag.
+                decades=float(os.environ.get("PHEASY_ALPHA_DECADES",
+                                             str(settings.ALPHA_DECADES))),
                 **alpha_kwargs,
             )
             if settings.MODEL.upper() == "LASSO":
@@ -1210,7 +1227,8 @@ class WorkFlow(object):
             # warn when alpha_opt sits at a grid edge (the CV wanted a value
             # outside the grid); this replaces the old shell retry loop.
             if settings.MODEL.upper() in ("LASSO", "ALASSO") and "alpha" in fit_results:
-                _grid = np.asarray(optimizer._alpha)
+                _grid = np.asarray(getattr(optimizer._model, "alphas_",
+                                               optimizer._alpha))
                 _aopt = float(fit_results["alpha"])
                 if _grid.size > 1 and _aopt > 0:
                     _lg_lo = float(np.log10(_grid[0]))
@@ -1235,7 +1253,8 @@ class WorkFlow(object):
                     "- Reaching the specified tolerance for the optimal "
                     + "alpha after {} iterations.".format(fit_results["n_iter"])
                 )
-                _used_alpha = np.asarray(optimizer._alpha)
+                _used_alpha = np.asarray(getattr(optimizer._model, "alphas_",
+                                                    optimizer._alpha))
                 if _used_alpha.size:
                     logger.info("- alpha_min: {:.3e}".format(float(_used_alpha[0])))
                     logger.info("- alpha_max: {:.3e}".format(float(_used_alpha[-1])))

@@ -838,6 +838,14 @@ def _reselect_alpha(model, A, y, sample_weight=None):
               "--max_iter, otherwise the fit is over-regularized."
               % (tied.size, best, float(alphas[tied].min()),
                  float(alphas[tied].max())), flush=True)
+    # [FIX P39] alpha* pinned to the grid MINIMUM means the CV curve is still
+    # falling at the low end (the optimum lies outside the grid) -- report it,
+    # otherwise the fit looks like a converged interior optimum when it is
+    # really just "the least regularization the grid would allow".
+    if new_alpha <= float(alphas.min()) * (1.0 + 1e-12):
+        print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV optimum "
+              "may lie outside the grid. Widen it (PHEASY_ALPHA_DECADES) or treat "
+              "this fit as effectively unregularized." % new_alpha, flush=True)
     if new_alpha == float(model.alpha_):
         return
     print("[CV] alpha reselected: %.6e -> %.6e" % (float(model.alpha_), new_alpha),
@@ -1076,6 +1084,13 @@ class _LassoCVIterative:
                   % (tied.size, best_mean, float(self.alphas[tied].min()),
                      float(self.alphas[tied].max()), cv_tol, cv_max_iter),
                   flush=True)
+        # [FIX P39] best_i == 0 is the SMALLEST alpha (the grid walks descending);
+        # the CV curve is still falling there, so the optimum is outside the grid.
+        if best_i == 0:
+            print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV "
+                  "optimum may lie outside the grid. Widen it "
+                  "(PHEASY_ALPHA_DECADES) or treat this fit as effectively "
+                  "unregularized." % float(self.alphas[0]), flush=True)
 
         self.alpha_ = float(self.alphas[best_i])
         # final refit at the chosen alpha, warm-started from the path. Cap the
@@ -1204,19 +1219,25 @@ class _AdaptiveLassoCV(_LassoCVModel):
         # right grid for BOTH the scaled (LassoCV on A/w) and the penalized
         # (FISTA with per-coordinate penalty w_j) ALASSO forms.
         _wgrid = os.environ.get("PHEASY_ALASSO_WEIGHTED_GRID", "1").lower() in ("1", "true", "yes")
-        # [FIX P38] the weighted-space override is an AUTO behavior: skip it
+        # [FIX P38/P39] the weighted-space override is an AUTO behavior: skip it
         # when the user asked for the manual --mu_min/--mu_max grid, exactly
         # like run_pheasy does for LASSO (ALPHA_AUTO gates derive_alpha_grid).
-        if self.nalpha and _wgrid and self.alpha_auto:
-            # [FIX P38] A.T @ y is needed for both thresholds; compute it once
-            # (a full rmatvec on a TwoLevelSM operator costs seconds on large
-            # systems, so the old double matvec was pure waste).
+        _override = bool(self.nalpha and _wgrid and self.alpha_auto)
+        if self.nalpha:
+            # [FIX P39] one rmatvec for BOTH the weighted KKT threshold and the
+            # unweighted one, kept in A's dtype so a float32 sensing matrix is not
+            # silently promoted to float64 (which doubles peak memory). The bare
+            # A.T @ float64(y) that used to be here upcast the whole SM.
+            _A_dt = A.dtype if hasattr(A, "dtype") else np.float64
             _g_raw = np.abs(np.asarray(
-                A.T @ np.asarray(y, dtype=np.float64).ravel(),
+                A.T @ np.asarray(y, dtype=np.float64).ravel().astype(_A_dt, copy=False),
                 dtype=np.float64)).ravel()
             _a_uw = float(_g_raw.max()) / n_samples
             _g = _g_raw / np.maximum(self._weights, 1e-300)
             _a_max = float(_g.max()) / n_samples
+        else:
+            _a_uw = _a_max = 0.0
+        if _override:
             if _a_max > 0 and np.isfinite(_a_max) and _a_uw > 0 and np.isfinite(_a_uw):
                 # [FIX P37] the weighted grid must also reach the UNDER-regularized
                 # regime. The 4-decade span below the weighted KKT threshold clips
@@ -1239,20 +1260,37 @@ class _AdaptiveLassoCV(_LassoCVModel):
                     _hi = _a_max
                     _lo = _a_max * 10.0 ** -self.decades
                 if _lo > 0 and np.isfinite(_lo) and _hi > _lo:
-                    # [FIX P38] keep the alpha resolution the user asked for: a
-                    # wider span must not coarsen the step (nmu=20 over ~7 decades
-                    # gives 2.3x steps vs the 1.62x of the default 4-decade grid,
-                    # so the CV optimum can sit between grid points). Scale the
-                    # point count to the span; the underdetermined branch does not
-                    # extend, so its point count is unchanged.
+                    # [FIX P38/P39] keep the alpha resolution the user asked for: a
+                    # wider span must not coarsen the step. n = 1 + (span/decades) *
+                    # (nmu-1) reproduces the original per-decade density exactly;
+                    # cap it (PHEASY_ALPHA_NMAX) so a tiny --alpha_decades cannot
+                    # balloon the grid. The underdetermined branch does not extend,
+                    # so its point count is unchanged (nmu).
                     _span = np.log10(_hi / _lo)
-                    _n = max(self.nalpha,
-                             int(np.ceil(_span * self.nalpha / max(self.decades, 1e-9))))
+                    _n = 1 + int(np.ceil(_span * (self.nalpha - 1) / max(self.decades, 1.0)))
+                    _n = min(_n, int(os.environ.get("PHEASY_ALPHA_NMAX", "200")))
+                    _n = max(_n, self.nalpha)
                     self.alphas = np.logspace(np.log10(_lo), np.log10(_hi), _n)
                     print("[ALASSO] weighted-space alpha grid: [%.3e .. %.3e] "
                           "(%d alphas, %.2f decades, step %.2fx)"
                           % (_lo, _hi, _n, _span,
                              10.0 ** (_span / max(_n - 1, 1))), flush=True)
+        elif self.nalpha and self.alphas.size > 1 and _a_max > 0:
+            # [FIX P39] manual grid (--no-alpha_auto): used AS-IS, but say how far
+            # off the weighted scale it is. A manual grid in the UNWEIGHTED scale
+            # over-regularizes ALASSO because the penalty lives in A/w space (the
+            # weights reach 1/eps ~ 1e8), so alpha* gets pinned to the grid bottom
+            # (known degradation: MnIn2Se4 c3=5.2 n45 [1e-6,1e-2] -> re 0.077,
+            # nnz 375 vs the weighted grid's re 0.0063, nnz 1223).
+            _lo_m = float(self.alphas.min())
+            _hi_m = float(self.alphas.max())
+            _gap = (np.log10(_a_max / _lo_m) if (_a_max > 0 and _lo_m > 0)
+                    else float("inf"))
+            print("[ALASSO] manual alpha grid [%.3e .. %.3e] used AS-IS; the "
+                  "penalty lives in weighted (A/w) space and its KKT threshold "
+                  "is %.3e, %.1f decades ABOVE the grid bottom -- an unweighted-"
+                  "scale grid over-regularizes ALASSO (alpha* will pin low)."
+                  % (_lo_m, _hi_m, _a_max, _gap), flush=True)
 
         if _lasso_backend(A) == "iterative":
             # [FIX P26] penalized form: pass per-coordinate weights w_j and
@@ -1593,6 +1631,7 @@ class Optimizer(object):
         standardize=False,
         fit_intercept=False,
         alpha_auto=True,
+        decades=4.0,
     ):
         self._method = method
         self._alpha_min = alpha_min
@@ -1605,6 +1644,7 @@ class Optimizer(object):
         self._standardize = standardize
         self._fit_intercept = fit_intercept
         self._alpha_auto = bool(alpha_auto)
+        self._decades = float(decades)
 
         if alpha is not None:
             self._alpha = np.asarray(alpha, dtype=np.float64)
@@ -1675,7 +1715,7 @@ class Optimizer(object):
                 init_alpha=float(os.environ.get("PHEASY_ALASSO_RIDGE_ALPHA", "1e-3")),
                 eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
                 nalpha=self._nalpha,
-                decades=float(os.environ.get("PHEASY_ALPHA_DECADES", "4.0")),
+                decades=self._decades,
                 alpha_auto=self._alpha_auto)
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
