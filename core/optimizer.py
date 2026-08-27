@@ -1129,11 +1129,14 @@ class _AdaptiveLassoCV(_LassoCVModel):
     Stage 2: weights w_j = 1/(|beta0_j| + eps)^gamma, then column-scaled LASSO.
     """
 
-    def __init__(self, *args, gamma=1.0, init_alpha=1e-3, eps=1e-8, **kwargs):
+    def __init__(self, *args, gamma=1.0, init_alpha=1e-3, eps=1e-8,
+                 nalpha=None, decades=4.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.gamma = float(gamma)
         self.init_alpha = float(init_alpha)
         self.eps = float(eps)
+        self.nalpha = int(nalpha) if nalpha else None
+        self.decades = float(decades)
         self._weights = None
 
     def _initial_estimate(self, A, y):
@@ -1146,6 +1149,22 @@ class _AdaptiveLassoCV(_LassoCVModel):
         n_samples = A.shape[0]
         beta0 = self._initial_estimate(A, y)
         self._weights = 1.0 / (np.abs(beta0) + self.eps) ** self.gamma
+
+        # [FIX P35] derive the alpha grid in the WEIGHTED space:
+        # (A/w)^T y = (A^T y)/w, so alpha_max = max_j |(A^T y)_j / w_j| / n.
+        # This replaces the unweighted grid + hardcoded mu_shift=-2 and is the
+        # right grid for BOTH the scaled (LassoCV on A/w) and the penalized
+        # (FISTA with per-coordinate penalty w_j) ALASSO forms.
+        _wgrid = os.environ.get("PHEASY_ALASSO_WEIGHTED_GRID", "1").lower() in ("1", "true", "yes")
+        if self.nalpha and _wgrid:
+            _g = np.abs(np.asarray(A.T @ np.asarray(y, dtype=np.float64).ravel(),
+                                   dtype=np.float64)).ravel()
+            _g = _g / np.maximum(self._weights, 1e-300)
+            _a_max = float(_g.max()) / n_samples
+            if _a_max > 0 and np.isfinite(_a_max):
+                self.alphas = np.logspace(
+                    np.log10(_a_max * 10.0 ** -self.decades), np.log10(_a_max),
+                    self.nalpha)
 
         if _lasso_backend(A) == "iterative":
             # [FIX P26] penalized form: pass per-coordinate weights w_j and
@@ -1248,6 +1267,11 @@ class _RFECVBase:
         self.lsmr_btol = float(lsmr_btol)
         self.block_rows = None if block_rows is None else int(block_rows)
         self.diag_floor = float(diag_floor)
+        # [FIX P35] feature-count selection criterion. Default "cv" (CV + 1-SE).
+        # RFE-OLS-TSQR overrides this from PHEASY_TSQR_CRITERION=bic|cv so it
+        # becomes a genuinely independent method (BIC) instead of a numerically
+        # identical twin of RFE.
+        self._criterion = "cv"
 
     def _cv_group_size(self, n_samples):
         gs = int(os.environ.get("PHEASY_CV_GROUP_SIZE", "0"))
@@ -1277,8 +1301,10 @@ class _RFECVBase:
 
         # [FIX P09] constructor value is the default; env var is an override
         patience = int(os.environ.get("PHEASY_RFE_PATIENCE", str(self.patience)))
+        criterion = getattr(self, "_criterion", "cv")
         active = np.ones(n_features, dtype=bool)
-        history = []  # (n_active, cv_mean, cv_se, support)
+        history = []      # (n_active, cv_mean, cv_se, support)
+        history_bic = []  # [FIX P35] (n_active, bic, support) for TSQR BIC
 
         if self.verbose:
             print(f"[RFE] START n_features={n_features}, step={self.step:.2f}, "
@@ -1299,6 +1325,12 @@ class _RFECVBase:
             coef_active = solve(idx)
             cv_mean, cv_se, _ = _cv_rmse(A, y, idx, solve, splits)
             history.append((n_active, cv_mean, cv_se, active.copy()))
+            # [FIX P35] BIC = n ln(RSS/n) + k ln(n) on the full-data fit.
+            if criterion == "bic":
+                _pred = _predict_subset(A, idx, None, coef_active)
+                _rss = float(np.sum((_pred - y) ** 2))
+                _bic = n_samples * np.log(_rss / n_samples) + n_active * np.log(n_samples)
+                history_bic.append((n_active, _bic, active.copy()))
 
             if self.verbose:
                 print(f"[RFE] Round {round_num:3d}: n_active={n_active:5d}  "
@@ -1331,6 +1363,13 @@ class _RFECVBase:
             # min_features >= n_features: nothing was eliminated, keep all.
             n_best, best_mean, best_se = n_features, 0.0, 0.0
             best_support = np.ones(n_features, dtype=bool)
+        elif criterion == "bic" and history_bic:
+            best_round = int(np.argmin([h[1] for h in history_bic]))
+            n_best, best_mean, best_se, best_support = history[best_round]
+            if self.verbose:
+                print("[RFE] BIC selected: n_active=%d, BIC=%.2e, "
+                      "CV_RMSE=%.6e" % (n_best, history_bic[best_round][1],
+                                        best_mean), flush=True)
         else:
             n_best, best_mean, best_se, best_support = _select_1se(history)
         best_idx = np.where(best_support)[0]
@@ -1391,6 +1430,10 @@ class PheasyRFE_OLS_TSQR(_RFECVBase):
                          verbose=verbose, random_state=random_state,
                          solver="qr", ridge_alpha=0.0, patience=patience,
                          block_rows=block_rows, diag_floor=diag_floor)
+        # [FIX P35] BIC is a genuinely independent stopping rule (the CV+1-SE
+        # path makes RFE and RFE-OLS-TSQR numerically identical).
+        _crit = os.environ.get("PHEASY_TSQR_CRITERION", "cv").lower()
+        self._criterion = "bic" if _crit == "bic" else "cv"
 
 
 # backward-compatible aliases
@@ -1498,7 +1541,9 @@ class Optimizer(object):
                 fit_intercept=self._fit_intercept, group_size=self._group_size,
                 gamma=float(os.environ.get("PHEASY_ALASSO_GAMMA", "1.0")),
                 init_alpha=float(os.environ.get("PHEASY_ALASSO_RIDGE_ALPHA", "1e-3")),
-                eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")))
+                eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
+                nalpha=self._nalpha,
+                decades=float(os.environ.get("PHEASY_ALPHA_DECADES", "4.0")))
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "RFE":
