@@ -226,9 +226,9 @@ def _tsqr_qless(A, y, block_rows=40000, diag_floor=1e-12):
     one growing [R; A_i] stack (the previous implementation), which lets
     rounding error accumulate along the chain for ill-conditioned matrices.
 
-    Peak memory is O((m / block_rows + 1) * n^2 + block_rows * n): one R per
-    block at level 0, then a shrinking set of R's.  Never a full Q or a full
-    copy of A.
+    Peak memory is O(ceil(log2(nblocks)) * n^2 + block_rows * n): same-level
+    R factors are merged on the fly, so at most one R per tree level is alive.
+    Never a full Q or a full copy of A.
 
     Returns (coef, rank_ok, cond_estimate).
     """
@@ -237,40 +237,49 @@ def _tsqr_qless(A, y, block_rows=40000, diag_floor=1e-12):
     block_rows = max(int(block_rows), n + 1)
 
     # ---- level 0: independent QR of each block --------------------------------
-    Rs = []
-    zs = []
+    # [FIX P36] streaming binary-tree TSQR: merge same-level R factors on the
+    # fly, so at most ceil(log2(nblocks))+1 R matrices are alive at any time
+    # (peak O(ceil(log2(nblocks))*n^2 + block_rows*n)) instead of materialising
+    # every level-0 R before reducing (O(nblocks*n^2), which for wide/small-
+    # block problems exceeds even O(m*n)). Same binary tree as the batch
+    # version, just a different traversal order -- numerically equivalent.
+    stack = []  # list of (level, R, z)
     for i0 in range(0, m, block_rows):
         i1 = min(i0 + block_rows, m)
         blk = A[i0:i1]
         blk = np.asarray(blk.toarray() if sp.issparse(blk) else blk, dtype=np.float64)
-        Q, Rb = spla.qr(blk, mode="economic", check_finite=False)
-        Rs.append(np.asarray(Rb, dtype=np.float64))
-        zs.append(np.asarray(Q.T @ y64[i0:i1], dtype=np.float64))
-        del Q, Rb, blk
-
-    # ---- binary-tree reduction of the R factors -------------------------------
-    while len(Rs) > 1:
-        nxt_R, nxt_z = [], []
-        for i in range(0, len(Rs), 2):
-            if i + 1 < len(Rs):
-                M = np.vstack([Rs[i], Rs[i + 1]])
-                b = np.concatenate([zs[i], zs[i + 1]])
-                Q, Rb = spla.qr(M, mode="economic", check_finite=False)
-                nxt_R.append(np.asarray(Rb, dtype=np.float64))
-                nxt_z.append(np.asarray(Q.T @ b, dtype=np.float64))
-                del Q, Rb, M, b
-            else:
-                nxt_R.append(Rs[i])
-                nxt_z.append(zs[i])
-        Rs, zs = nxt_R, nxt_z
-
-    R = Rs[0]
-    z = zs[0]
+        Q, R = spla.qr(blk, mode="economic", check_finite=False)
+        z = np.asarray(Q.T @ y64[i0:i1], dtype=np.float64)
+        del Q, blk
+        lvl = 0
+        while stack and stack[-1][0] == lvl:   # merge same-level on the fly
+            _l0, R0, z0 = stack.pop()
+            M = np.vstack([R0, R])
+            b = np.concatenate([z0, z])
+            Q, R = spla.qr(M, mode="economic", check_finite=False)
+            z = np.asarray(Q.T @ b, dtype=np.float64)
+            del Q, M, b, R0, z0
+            lvl += 1
+        stack.append((lvl, R, z))
+    while len(stack) > 1:                       # finish the residual tree
+        l1, R1, z1 = stack.pop()
+        l0, R0, z0 = stack.pop()
+        M = np.vstack([R0, R1])
+        b = np.concatenate([z0, z1])
+        Q, R = spla.qr(M, mode="economic", check_finite=False)
+        z = np.asarray(Q.T @ b, dtype=np.float64)
+        stack.append((max(l0, l1) + 1, R, z))
+    R = stack[0][1]
+    z = stack[0][2]
     wide = R.shape[0] < R.shape[1]
     diag = np.abs(np.diag(R))
     dmax = float(diag.max()) if diag.size else 0.0
     dmin = float(diag.min()) if diag.size else 0.0
-    cond = (dmax / dmin) if dmin > 0 else np.inf
+    if wide:
+        # [FIX P36] diag of a wide R does not reflect conditioning.
+        cond = np.nan
+    else:
+        cond = (dmax / dmin) if dmin > 0 else np.inf
     if dmax == 0.0 or (not wide and dmin <= diag_floor * max(dmax, 1.0)):
         return None, False, cond
     if wide:
@@ -1367,8 +1376,12 @@ class _RFECVBase:
                            np.finfo(float).tiny * n_samples)
                 _n_eff, _gs = self._bic_n_eff(n_samples)
                 # dimension-consistent: fit term and penalty share n_eff
+                # [FIX P36] k+1 counts sigma^2 as a parameter (constant offset;
+                # argmin over k is unchanged but the reported absolute value is
+                # the textbook AIC/BIC).
                 _loglik = _n_eff * np.log(_rss / _n_eff)
-                _pen = n_active * np.log(_n_eff) if criterion == "bic" else 2 * n_active
+                _pen = ((n_active + 1) * np.log(_n_eff) if criterion == "bic"
+                        else 2 * (n_active + 1))
                 _ic = _loglik + _pen
                 history_bic.append((n_active, _ic, active.copy()))
                 cv_mean, cv_se = 0.0, 0.0
@@ -1482,8 +1495,13 @@ class PheasyRFE_OLS_TSQR(_RFECVBase):
                          verbose=verbose, random_state=random_state,
                          solver="qr", ridge_alpha=0.0, patience=patience,
                          block_rows=block_rows, diag_floor=diag_floor)
-        # [FIX P35] BIC is a genuinely independent stopping rule (the CV+1-SE
-        # path makes RFE and RFE-OLS-TSQR numerically identical).
+        # [FIX P35] BIC/AIC are genuinely independent stopping rules (the
+        # CV+1-SE path makes RFE and RFE-OLS-TSQR numerically identical).
+        # NOTE: with the grouped-CV n_eff (configuration count, often tens),
+        # BIC's k*ln(n_eff) penalty is heavy and picks over-sparse models
+        # (e.g. MnIn2Se4 n_eff=45 -> 21 features, CV_RMSE 78x worse than CV's
+        # 1238). CV remains the recommended default; BIC/AIC are sensible only
+        # when n_eff is large (hundreds+).
         _crit = os.environ.get("PHEASY_TSQR_CRITERION", "cv").lower()
         self._criterion = _crit if _crit in ("bic", "aic") else "cv"
 
