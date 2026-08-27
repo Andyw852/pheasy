@@ -1227,8 +1227,11 @@ class WorkFlow(object):
             # warn when alpha_opt sits at a grid edge (the CV wanted a value
             # outside the grid); this replaces the old shell retry loop.
             if settings.MODEL.upper() in ("LASSO", "ALASSO") and "alpha" in fit_results:
-                _grid = np.asarray(getattr(optimizer._model, "alphas_",
-                                               optimizer._alpha))
+                # [FIX P40] model.alphas_ is DESCENDING for the sklearn backend
+                # (LassoCV sorts its path largest-first) but ascending for the FISTA
+                # backend; np.sort makes the edge check and the summary order-agnostic.
+                _grid = np.sort(np.asarray(getattr(optimizer._model, "alphas_",
+                                                   optimizer._alpha)))
                 _aopt = float(fit_results["alpha"])
                 if _grid.size > 1 and _aopt > 0:
                     _lg_lo = float(np.log10(_grid[0]))
@@ -1253,8 +1256,8 @@ class WorkFlow(object):
                     "- Reaching the specified tolerance for the optimal "
                     + "alpha after {} iterations.".format(fit_results["n_iter"])
                 )
-                _used_alpha = np.asarray(getattr(optimizer._model, "alphas_",
-                                                    optimizer._alpha))
+                _used_alpha = np.sort(np.asarray(getattr(optimizer._model, "alphas_",
+                                                            optimizer._alpha)))
                 if _used_alpha.size:
                     logger.info("- alpha_min: {:.3e}".format(float(_used_alpha[0])))
                     logger.info("- alpha_max: {:.3e}".format(float(_used_alpha[-1])))

@@ -581,7 +581,10 @@ class InputParser(argparse.ArgumentParser):
             default=4.0,
             type=float,
             help="""Only valid when ALPHA_AUTO is enabled. Number of orders of
-                    magnitude the auto alpha grid spans below alpha_max.""",
+                    magnitude the auto alpha grid spans below alpha_max. For the
+                    ALASSO weighted grid, the overdetermined grid is anchored at
+                    the weighted KKT threshold and reaches at least 6 decades
+                    below the min(weighted, unweighted) threshold.""",
         )
         self.add_argument(
             "--mu_min",
