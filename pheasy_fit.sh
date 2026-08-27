@@ -53,6 +53,8 @@
 #    PHEASY_RFE_MIN_FEATURES RFE 最小保留特征数
 #    PHEASY_OLS_TWOLEVEL=0   关闭 OLS 两级 matvec
 #    PHEASY_LASSO_1SE=1      LASSO CV 用 1-SE 规则
+#    PHEASY_TSQR_CRITERION=  TSQR 判停: cv|bic|aic (默认 cv)
+#    PHEASY_BIC_N_EFF=      BIC/AIC 的有效观测: groups|samples (默认 groups=构型数)
 #
 #  示例：
 #    bash pheasy_fit.sh FIT_METHOD=OLS    C3_CUTOFF=5.2

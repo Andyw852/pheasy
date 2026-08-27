@@ -266,13 +266,21 @@ def _tsqr_qless(A, y, block_rows=40000, diag_floor=1e-12):
 
     R = Rs[0]
     z = zs[0]
+    wide = R.shape[0] < R.shape[1]
     diag = np.abs(np.diag(R))
     dmax = float(diag.max()) if diag.size else 0.0
     dmin = float(diag.min()) if diag.size else 0.0
     cond = (dmax / dmin) if dmin > 0 else np.inf
-    if dmax == 0.0 or dmin <= diag_floor * max(dmax, 1.0):
+    if dmax == 0.0 or (not wide and dmin <= diag_floor * max(dmax, 1.0)):
         return None, False, cond
-    coef = spla.solve_triangular(R, z, lower=False, check_finite=False)
+    if wide:
+        # [FIX P35] underdetermined (m < n): the reduced R is (m, n) and not
+        # square, so the diag-based rank criterion is meaningless and
+        # solve_triangular would raise. min-norm lstsq == gelsd on the
+        # original A (e.g. c3=7.0 with a small NDATA, or small block_rows).
+        coef = spla.lstsq(R, z, check_finite=False)[0]
+    else:
+        coef = spla.solve_triangular(R, z, lower=False, check_finite=False)
     return np.asarray(coef, dtype=np.float64), True, cond
 
 
@@ -292,10 +300,15 @@ def _solve_qr(A, y, block_rows=None, diag_floor=1e-12):
     if sp.issparse(A) and not _should_densify_sparse(A):
         return _solve_sparse_lsqr(A, y)
     if block_rows and A.shape[0] > int(block_rows):
-        coef, ok, _cond = _tsqr_qless(A, y, block_rows, diag_floor)
+        # [FIX P35] _tsqr_qless can raise (e.g. wide matrices); catch so the
+        # SVD fallback actually runs instead of propagating the exception.
+        try:
+            coef, ok, _cond = _tsqr_qless(A, y, block_rows, diag_floor)
+        except Exception:
+            ok = False
         if ok:
             return coef
-        return _solve_lstsq(A, y)     # rank deficient -> SVD
+        return _solve_lstsq(A, y)     # rank deficient / wide -> SVD
     A64 = _to_dense_f64(A)
     y64 = np.asarray(y, dtype=np.float64).ravel()
     Q, R = spla.qr(A64, mode="economic", check_finite=False)
@@ -1345,23 +1358,26 @@ class _RFECVBase:
                 break
 
             coef_active = solve(idx)
-            if criterion == "bic":
-                # [FIX P35] BIC mode: no CV needed for stopping (skips the K-fold
+            if criterion in ("bic", "aic"):
+                # [FIX P35] IC mode: no CV needed for stopping (skips the K-fold
                 # sub-solves -> ~5x faster); CV is computed once at the end for
-                # the report only. Loop driven by BIC's own patience.
+                # the report only. Loop driven by the criterion's own patience.
                 _pred = _predict_subset(A, idx, None, coef_active)
                 _rss = max(float(np.sum((_pred - y) ** 2)),
                            np.finfo(float).tiny * n_samples)
                 _n_eff, _gs = self._bic_n_eff(n_samples)
-                _bic = _n_eff * np.log(_rss / n_samples) + n_active * np.log(_n_eff)
-                history_bic.append((n_active, _bic, active.copy()))
+                # dimension-consistent: fit term and penalty share n_eff
+                _loglik = _n_eff * np.log(_rss / _n_eff)
+                _pen = n_active * np.log(_n_eff) if criterion == "bic" else 2 * n_active
+                _ic = _loglik + _pen
+                history_bic.append((n_active, _ic, active.copy()))
                 cv_mean, cv_se = 0.0, 0.0
                 if self.verbose:
                     print(f"[RFE] Round {round_num:3d}: n_active={n_active:5d}  "
-                          f"BIC={_bic:.2e} (n_eff={_n_eff})  "
+                          f"{criterion.upper()}={_ic:.2e} (n_eff={_n_eff})  "
                           f"nonzero={int(np.count_nonzero(coef_active))}", flush=True)
-                if _bic < best_bic:
-                    best_bic = _bic
+                if _ic < best_bic:
+                    best_bic = _ic
                     no_improve = 0
                 else:
                     no_improve += 1
@@ -1394,7 +1410,7 @@ class _RFECVBase:
             round_num += 1
 
         # --- selection (each criterion prints its own summary, once) ---
-        if criterion == "bic" and history_bic:
+        if criterion in ("bic", "aic") and history_bic:
             best_round = int(np.argmin([h[1] for h in history_bic]))
             n_best = history_bic[best_round][0]
             best_support = history_bic[best_round][2]
@@ -1402,7 +1418,7 @@ class _RFECVBase:
             _sel = np.where(best_support)[0]
             best_mean, best_se, _ = _cv_rmse(A, y, _sel, solve, splits)
             if self.verbose:
-                print("[RFE] BIC min: n_active=%d, BIC=%.2e" % (n_best, history_bic[best_round][1]), flush=True)
+                print("[RFE] %s min: n_active=%d, %s=%.2e" % (criterion.upper(), n_best, criterion.upper(), history_bic[best_round][1]), flush=True)
                 print("[RFE] selected: n_active=%d, CV_RMSE=%.6e (+-%.2e)" % (n_best, best_mean, best_se), flush=True)
         elif history:
             n_best, best_mean, best_se, best_support = _select_1se(history)
@@ -1469,7 +1485,7 @@ class PheasyRFE_OLS_TSQR(_RFECVBase):
         # [FIX P35] BIC is a genuinely independent stopping rule (the CV+1-SE
         # path makes RFE and RFE-OLS-TSQR numerically identical).
         _crit = os.environ.get("PHEASY_TSQR_CRITERION", "cv").lower()
-        self._criterion = "bic" if _crit == "bic" else "cv"
+        self._criterion = _crit if _crit in ("bic", "aic") else "cv"
 
 
 # backward-compatible aliases
