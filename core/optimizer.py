@@ -310,10 +310,16 @@ def _solve_qr(A, y, block_rows=None, diag_floor=1e-12):
     tol = np.finfo(float).eps * max(A64.shape) * dmax
     if float(diag.min()) <= tol:
         return _solve_lstsq(A, y)
-    return np.asarray(
-        spla.solve_triangular(R, Q.T @ y64, lower=False, check_finite=False),
-        dtype=np.float64,
-    )
+    if R.shape[0] == R.shape[1]:
+        coef = spla.solve_triangular(R, Q.T @ y64, lower=False, check_finite=False)
+    else:
+        # [FIX P35] wide / underdetermined (n_rows < n_features): the economic
+        # QR gives a non-square R, so solve_triangular fails.  The min-norm
+        # least-squares solution of R x = Q^T y equals gelsd on the original
+        # A, which is what the other solvers return for the underdetermined
+        # case (e.g. c3=7.0 with a small NDATA).
+        coef = spla.lstsq(R, Q.T @ y64, check_finite=False)[0]
+    return np.asarray(coef, dtype=np.float64)
 
 
 def _make_masked_op(A, row_idx, col_idx):
