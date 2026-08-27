@@ -49,6 +49,8 @@ def parse_log(d, m, n):
                 info["rel_err"] = float(line.rsplit(":", 1)[1])
             elif "Non-zero IFC terms:" in line:
                 info["nnz"] = int(line.rsplit(":", 1)[1])
+            elif "Free IFC terms:" in line:
+                info["p"] = int(line.rsplit(":", 1)[1])
             elif "alpha_opt:" in line:
                 info["alpha"] = float(line.rsplit(":", 1)[1])
             elif "best CV RMSE:" in line:
@@ -100,26 +102,31 @@ def main():
             a3 = np.abs(phi[n2:]).max() if len(ref3) else np.nan
             r3 = np.abs(ref3).max() if len(ref3) else np.nan
             info = parse_log(args.resultdir, m, n)
+            _p = info.get("p")
+            info["nnz_p"] = (float(info["nnz"]) / _p
+                             if (_p and info.get("nnz")) else np.nan)
             rows.append(dict(method=m, ndata=n, relL2_fc2=e2, relL2_fc3=e3,
                              fc3max=a3, dev3=(a3 - r3) / r3 * 100 if r3 else np.nan,
                              **info))
 
-    hdr = ("%-14s %5s %11s %11s %9s %9s %10s %6s %s"
+    hdr = ("%-14s %5s %11s %11s %9s %9s %10s %6s %6s %s"
            % ("method", "ndata", "relL2_fc2", "relL2_fc3", "fc3max", "dev3%",
-              "rel_err", "nnz", "note"))
+              "rel_err", "nnz", "nnz/p", "note"))
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
         note = "TIE!" if r.get("tie") else ""
-        print("%-14s %5d %11.3e %11.3e %9.4f %9.3f %10.6f %6s %s"
+        _nnzp = ("%.2f" % r["nnz_p"]) if (r.get("nnz_p") is not None
+                                          and np.isfinite(r["nnz_p"])) else "-"
+        print("%-14s %5d %11.3e %11.3e %9.4f %9.3f %10.6f %6s %6s %s"
               % (r["method"], r["ndata"], r["relL2_fc2"], r["relL2_fc3"],
                  r["fc3max"], r["dev3"], r.get("rel_err", float("nan")),
-                 r.get("nnz", "-"), note))
+                 r.get("nnz", "-"), _nnzp, note))
 
     if args.csv:
         import csv
         keys = ["method", "ndata", "relL2_fc2", "relL2_fc3", "fc3max", "dev3",
-                "rel_err", "nnz", "cv", "alpha"]
+                "rel_err", "nnz", "cv", "alpha", "nnz_p"]
         with open(args.csv, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=keys, extrasaction="ignore")
             w.writeheader()

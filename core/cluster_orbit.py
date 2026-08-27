@@ -138,7 +138,7 @@ class Cluster(object):
 
     @property
     def trans(self):
-        """trans: Translational vect/public/home/wangchao/miniconda3/envs/atomate2_p_a/lib/python3.11/site-packages/pheasy/core/cluster_orbit.py
+        """trans: Translational vect/public/home/.../miniconda3/envs/atomate2_p_a/lib/python3.11/site-packages/pheasy/core/cluster_orbit.py
 or in crystal coordinate."""
         return self._trans
 

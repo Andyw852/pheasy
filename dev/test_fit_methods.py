@@ -7,7 +7,7 @@ the fit quality and the reconstructed force-constant amplitudes.
 
 Usage:
     cd MnIn2Se4_lasso
-    PYTHONPATH=/home/wangchao/software python3 ../dev/test_fit_methods.py
+    PYTHONPATH=~/software python3 ../dev/test_fit_methods.py
 """
 import os
 import time
