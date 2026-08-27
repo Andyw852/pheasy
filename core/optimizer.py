@@ -1204,10 +1204,35 @@ class _AdaptiveLassoCV(_LassoCVModel):
                                    dtype=np.float64)).ravel()
             _g = _g / np.maximum(self._weights, 1e-300)
             _a_max = float(_g.max()) / n_samples
-            if _a_max > 0 and np.isfinite(_a_max):
-                self.alphas = np.logspace(
-                    np.log10(_a_max * 10.0 ** -self.decades), np.log10(_a_max),
-                    self.nalpha)
+            _a_uw = float(np.abs(np.asarray(
+                A.T @ np.asarray(y, dtype=np.float64).ravel(),
+                dtype=np.float64)).max()) / n_samples
+            if _a_max > 0 and np.isfinite(_a_max) and _a_uw > 0 and np.isfinite(_a_uw):
+                # [FIX P37] the weighted grid must also reach the UNDER-regularized
+                # regime. The 4-decade span below the weighted KKT threshold clips
+                # the CV optimum whenever the true model is dense (measured on
+                # MnIn2Se4 c3=7.0 n=45: nnz 546 / rel_err 6.5% with the 4-decade
+                # span vs nnz 3317 / rel_err 0.55% once the bottom reaches the
+                # unweighted-threshold scale; the CV optimum for a dense model sits
+                # far below the weighted threshold). Anchor the top at the weighted
+                # KKT threshold and the bottom at 10^-max(decades, 6) below the
+                # MIN of the two thresholds.
+                # Only extend for overdetermined problems (n_rows > n_cols): an
+                # underdetermined system genuinely needs regularization, its CV
+                # optimum is interior, and the extra low-alpha tail just makes
+                # coordinate descent crawl (MnIn2Se4 c3=7.0 n=4: 11s -> 649s for a
+                # result within 5% of the 4-decade one).
+                # top = the weighted KKT threshold (a_max_w); the unweighted
+                # threshold is only used to place the bottom on overdetermined
+                # problems where the dense-model optimum sits far below.
+                if n_samples > A.shape[1]:
+                    _hi = _a_max
+                    _lo = min(_a_max, _a_uw) * 10.0 ** -max(self.decades, 6.0)
+                else:
+                    _hi = _a_max
+                    _lo = _a_max * 10.0 ** -self.decades
+                if _lo > 0 and np.isfinite(_lo) and _hi > _lo:
+                    self.alphas = np.logspace(np.log10(_lo), np.log10(_hi), self.nalpha)
 
         if _lasso_backend(A) == "iterative":
             # [FIX P26] penalized form: pass per-coordinate weights w_j and

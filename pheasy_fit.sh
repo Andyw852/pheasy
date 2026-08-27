@@ -55,6 +55,9 @@
 #    PHEASY_LASSO_1SE=1      LASSO CV 用 1-SE 规则
 #    PHEASY_TSQR_CRITERION=  TSQR 判停: cv|bic|aic (默认 cv)
 #    PHEASY_BIC_N_EFF=      BIC/AIC 的有效观测: groups|samples (默认 groups=构型数)
+#    PHEASY_ALASSO_WEIGHTED_GRID= ALASSO 加权 alpha 网格 (默认 1)。
+#                           0=回退 mu_shift 经验网格; 1=KKT 阈值网格,
+#                           跨度>=8 个数量级以覆盖低正则化区 (P37)
 #
 #  示例：
 #    bash pheasy_fit.sh FIT_METHOD=OLS    C3_CUTOFF=5.2
