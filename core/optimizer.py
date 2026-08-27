@@ -1279,6 +1279,21 @@ class _RFECVBase:
             return gs
         return None
 
+    def _bic_n_eff(self, n_samples):
+        """[FIX P35] effective independent observations for BIC.
+
+        Force components in one configuration are highly correlated (3*natoms
+        rows per config) -- the same reason the CV is grouped.  BIC's n should
+        therefore be the CONFIGURATION count, not the raw row count, or the
+        k*ln(n) penalty is off by ln(3*natoms) and the fit term is inflated by
+        3*natoms. PHEASY_BIC_N_EFF=samples falls back to raw rows.
+        """
+        gs = self._cv_group_size(n_samples)
+        if (os.environ.get("PHEASY_BIC_N_EFF", "groups").lower() != "samples"
+                and gs and gs > 1 and n_samples % gs == 0):
+            return n_samples // gs, gs
+        return n_samples, gs
+
     def fit(self, A, y, sample_weight=None):
         y = np.asarray(y, dtype=np.float64).ravel()
         n_samples, n_features = A.shape
@@ -1315,6 +1330,7 @@ class _RFECVBase:
 
         round_num = 0
         best_cv = float("inf")
+        best_bic = float("inf")
         no_improve = 0
         while True:
             idx = np.where(active)[0]
@@ -1323,30 +1339,42 @@ class _RFECVBase:
                 break
 
             coef_active = solve(idx)
-            cv_mean, cv_se, _ = _cv_rmse(A, y, idx, solve, splits)
-            history.append((n_active, cv_mean, cv_se, active.copy()))
-            # [FIX P35] BIC = n ln(RSS/n) + k ln(n) on the full-data fit.
             if criterion == "bic":
+                # [FIX P35] BIC mode: no CV needed for stopping (skips the K-fold
+                # sub-solves -> ~5x faster); CV is computed once at the end for
+                # the report only. Loop driven by BIC's own patience.
                 _pred = _predict_subset(A, idx, None, coef_active)
-                _rss = float(np.sum((_pred - y) ** 2))
-                _bic = n_samples * np.log(_rss / n_samples) + n_active * np.log(n_samples)
+                _rss = max(float(np.sum((_pred - y) ** 2)),
+                           np.finfo(float).tiny * n_samples)
+                _n_eff, _gs = self._bic_n_eff(n_samples)
+                _bic = _n_eff * np.log(_rss / n_samples) + n_active * np.log(_n_eff)
                 history_bic.append((n_active, _bic, active.copy()))
-
-            if self.verbose:
-                print(f"[RFE] Round {round_num:3d}: n_active={n_active:5d}  "
-                      f"CV_RMSE={cv_mean:.6e} (+-{cv_se:.2e})  "
-                      f"nonzero={int(np.count_nonzero(coef_active))}", flush=True)
-
-            # early stop once CV has stopped improving for `patience` rounds;
-            # further elimination can only degrade the 1-SE-selected model.
-            if cv_mean < best_cv:
-                best_cv = cv_mean
-                no_improve = 0
+                cv_mean, cv_se = 0.0, 0.0
+                if self.verbose:
+                    print(f"[RFE] Round {round_num:3d}: n_active={n_active:5d}  "
+                          f"BIC={_bic:.2e} (n_eff={_n_eff})  "
+                          f"nonzero={int(np.count_nonzero(coef_active))}", flush=True)
+                if _bic < best_bic:
+                    best_bic = _bic
+                    no_improve = 0
+                else:
+                    no_improve += 1
             else:
-                no_improve += 1
+                cv_mean, cv_se, _ = _cv_rmse(A, y, idx, solve, splits)
+                history.append((n_active, cv_mean, cv_se, active.copy()))
+                if self.verbose:
+                    print(f"[RFE] Round {round_num:3d}: n_active={n_active:5d}  "
+                          f"CV_RMSE={cv_mean:.6e} (+-{cv_se:.2e})  "
+                          f"nonzero={int(np.count_nonzero(coef_active))}", flush=True)
+                if cv_mean < best_cv:
+                    best_cv = cv_mean
+                    no_improve = 0
+                else:
+                    no_improve += 1
             if no_improve >= patience:
                 if self.verbose:
-                    print(f"[RFE] CV 连续 {patience} 轮无改善, 提前停止.", flush=True)
+                    print(f"[RFE] {criterion.upper()} 连续 {patience} 轮无改善, 提前停止.",
+                          flush=True)
                 break
 
             if n_active <= self.min_features:
@@ -1359,26 +1387,28 @@ class _RFECVBase:
             active[idx[remove_local]] = False
             round_num += 1
 
-        if not history:
+        # --- selection (each criterion prints its own summary, once) ---
+        if criterion == "bic" and history_bic:
+            best_round = int(np.argmin([h[1] for h in history_bic]))
+            n_best = history_bic[best_round][0]
+            best_support = history_bic[best_round][2]
+            # CV once for the selected round (report only)
+            _sel = np.where(best_support)[0]
+            best_mean, best_se, _ = _cv_rmse(A, y, _sel, solve, splits)
+            if self.verbose:
+                print("[RFE] BIC min: n_active=%d, BIC=%.2e" % (n_best, history_bic[best_round][1]), flush=True)
+                print("[RFE] selected: n_active=%d, CV_RMSE=%.6e (+-%.2e)" % (n_best, best_mean, best_se), flush=True)
+        elif history:
+            n_best, best_mean, best_se, best_support = _select_1se(history)
+            if self.verbose:
+                argmin = history[int(np.argmin([h[1] for h in history]))]
+                print(f"[RFE] argmin: n_active={argmin[0]}, CV={argmin[1]:.6e}", flush=True)
+                print(f"[RFE] selected: n_active={n_best}, CV={best_mean:.6e} (+-{best_se:.2e})", flush=True)
+        else:
             # min_features >= n_features: nothing was eliminated, keep all.
             n_best, best_mean, best_se = n_features, 0.0, 0.0
             best_support = np.ones(n_features, dtype=bool)
-        elif criterion == "bic" and history_bic:
-            best_round = int(np.argmin([h[1] for h in history_bic]))
-            n_best, best_mean, best_se, best_support = history[best_round]
-            if self.verbose:
-                print("[RFE] BIC selected: n_active=%d, BIC=%.2e, "
-                      "CV_RMSE=%.6e" % (n_best, history_bic[best_round][1],
-                                        best_mean), flush=True)
-        else:
-            n_best, best_mean, best_se, best_support = _select_1se(history)
         best_idx = np.where(best_support)[0]
-
-        if self.verbose and history:
-            argmin = history[int(np.argmin([h[1] for h in history]))]
-            print(f"[RFE] argmin: n_active={argmin[0]}, CV={argmin[1]:.6e}", flush=True)
-            print(f"[RFE] selected: n_active={n_best}, CV={best_mean:.6e} "
-                  f"(+-{best_se:.2e})", flush=True)
 
         coef_final = solve(best_idx)
         coef_full = np.zeros(n_features, dtype=np.float64)
