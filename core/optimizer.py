@@ -234,7 +234,12 @@ def _tsqr_qless(A, y, block_rows=40000, diag_floor=1e-12):
     """
     m, n = A.shape
     y64 = np.asarray(y, dtype=np.float64).ravel()
-    block_rows = max(int(block_rows), n + 1)
+    # [FIX P36] no longer force block_rows >= n+1: the wide-matrix branch in
+    # the final solve handles level-0 R factors that are wider than tall (which
+    # the tree reduction accumulates to full rank). Letting the user pick a
+    # small block_rows shrinks the block densification buffer from
+    # block_rows*n*8 to blk*n*8 (e.g. cutoff 5.5: 21 GB -> 1.7 GB at blk=4000).
+    block_rows = max(int(block_rows), 1)
 
     # ---- level 0: independent QR of each block --------------------------------
     # [FIX P36] streaming binary-tree TSQR: merge same-level R factors on the
