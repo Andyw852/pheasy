@@ -1143,8 +1143,11 @@ class WorkFlow(object):
                     from pheasy.core.optimizer import derive_alpha_grid as _derive_alpha
                     _shift = 0.0
                     if settings.MODEL.upper() == "ALASSO":
-                        # adaptive weights enlarge the effective penalty; shift the
-                        # grid down so the CV optimum is not pushed to the low edge.
+                        # [FIX P38] fallback only: with PHEASY_ALASSO_WEIGHTED_GRID=0
+                        # shift the grid down by the old empirical mu_shift (kept
+                        # for reproducibility; it happens to reach the low-alpha
+                        # regime on these systems but is not principled). The
+                        # weighted KKT-threshold grid (P37/P38) is the default.
                         _shift = float(os.environ.get("PHEASY_ALASSO_MU_SHIFT", "-2"))
                     _grid = _derive_alpha(
                         SM, FM, nalpha=settings.NALPHA,
@@ -1168,6 +1171,10 @@ class WorkFlow(object):
                 max_iter=settings.MAX_ITER,
                 rand_seed=settings.RAND_SEED,
                 standardize=settings.STANDARDIZE,
+                # [FIX P38] ALASSO must honor --alpha_auto like LASSO: the
+                # weighted-space grid is only derived when the user asked for
+                # auto grids; --mu_min/--mu_max grids are respected as given.
+                alpha_auto=settings.ALPHA_AUTO,
                 **alpha_kwargs,
             )
             if settings.MODEL.upper() == "LASSO":

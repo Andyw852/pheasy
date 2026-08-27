@@ -1173,13 +1173,18 @@ class _AdaptiveLassoCV(_LassoCVModel):
     """
 
     def __init__(self, *args, gamma=1.0, init_alpha=1e-3, eps=1e-8,
-                 nalpha=None, decades=4.0, **kwargs):
+                 nalpha=None, decades=4.0, alpha_auto=True, **kwargs):
         super().__init__(*args, **kwargs)
         self.gamma = float(gamma)
         self.init_alpha = float(init_alpha)
         self.eps = float(eps)
         self.nalpha = int(nalpha) if nalpha else None
         self.decades = float(decades)
+        # [FIX P38] the weighted-space grid is an AUTO-mode behavior: it must
+        # not clobber a user-supplied manual --mu_min/--mu_max grid. run_pheasy
+        # only derives the LASSO grid when --alpha_auto is on; ALASSO must
+        # respect the same flag instead of unconditionally overriding.
+        self.alpha_auto = bool(alpha_auto)
         self._weights = None
 
     def _initial_estimate(self, A, y):
@@ -1199,14 +1204,19 @@ class _AdaptiveLassoCV(_LassoCVModel):
         # right grid for BOTH the scaled (LassoCV on A/w) and the penalized
         # (FISTA with per-coordinate penalty w_j) ALASSO forms.
         _wgrid = os.environ.get("PHEASY_ALASSO_WEIGHTED_GRID", "1").lower() in ("1", "true", "yes")
-        if self.nalpha and _wgrid:
-            _g = np.abs(np.asarray(A.T @ np.asarray(y, dtype=np.float64).ravel(),
-                                   dtype=np.float64)).ravel()
-            _g = _g / np.maximum(self._weights, 1e-300)
-            _a_max = float(_g.max()) / n_samples
-            _a_uw = float(np.abs(np.asarray(
+        # [FIX P38] the weighted-space override is an AUTO behavior: skip it
+        # when the user asked for the manual --mu_min/--mu_max grid, exactly
+        # like run_pheasy does for LASSO (ALPHA_AUTO gates derive_alpha_grid).
+        if self.nalpha and _wgrid and self.alpha_auto:
+            # [FIX P38] A.T @ y is needed for both thresholds; compute it once
+            # (a full rmatvec on a TwoLevelSM operator costs seconds on large
+            # systems, so the old double matvec was pure waste).
+            _g_raw = np.abs(np.asarray(
                 A.T @ np.asarray(y, dtype=np.float64).ravel(),
-                dtype=np.float64)).max()) / n_samples
+                dtype=np.float64)).ravel()
+            _a_uw = float(_g_raw.max()) / n_samples
+            _g = _g_raw / np.maximum(self._weights, 1e-300)
+            _a_max = float(_g.max()) / n_samples
             if _a_max > 0 and np.isfinite(_a_max) and _a_uw > 0 and np.isfinite(_a_uw):
                 # [FIX P37] the weighted grid must also reach the UNDER-regularized
                 # regime. The 4-decade span below the weighted KKT threshold clips
@@ -1222,9 +1232,6 @@ class _AdaptiveLassoCV(_LassoCVModel):
                 # optimum is interior, and the extra low-alpha tail just makes
                 # coordinate descent crawl (MnIn2Se4 c3=7.0 n=4: 11s -> 649s for a
                 # result within 5% of the 4-decade one).
-                # top = the weighted KKT threshold (a_max_w); the unweighted
-                # threshold is only used to place the bottom on overdetermined
-                # problems where the dense-model optimum sits far below.
                 if n_samples > A.shape[1]:
                     _hi = _a_max
                     _lo = min(_a_max, _a_uw) * 10.0 ** -max(self.decades, 6.0)
@@ -1232,7 +1239,20 @@ class _AdaptiveLassoCV(_LassoCVModel):
                     _hi = _a_max
                     _lo = _a_max * 10.0 ** -self.decades
                 if _lo > 0 and np.isfinite(_lo) and _hi > _lo:
-                    self.alphas = np.logspace(np.log10(_lo), np.log10(_hi), self.nalpha)
+                    # [FIX P38] keep the alpha resolution the user asked for: a
+                    # wider span must not coarsen the step (nmu=20 over ~7 decades
+                    # gives 2.3x steps vs the 1.62x of the default 4-decade grid,
+                    # so the CV optimum can sit between grid points). Scale the
+                    # point count to the span; the underdetermined branch does not
+                    # extend, so its point count is unchanged.
+                    _span = np.log10(_hi / _lo)
+                    _n = max(self.nalpha,
+                             int(np.ceil(_span * self.nalpha / max(self.decades, 1e-9))))
+                    self.alphas = np.logspace(np.log10(_lo), np.log10(_hi), _n)
+                    print("[ALASSO] weighted-space alpha grid: [%.3e .. %.3e] "
+                          "(%d alphas, %.2f decades, step %.2fx)"
+                          % (_lo, _hi, _n, _span,
+                             10.0 ** (_span / max(_n - 1, 1))), flush=True)
 
         if _lasso_backend(A) == "iterative":
             # [FIX P26] penalized form: pass per-coordinate weights w_j and
@@ -1572,6 +1592,7 @@ class Optimizer(object):
         rand_seed=None,
         standardize=False,
         fit_intercept=False,
+        alpha_auto=True,
     ):
         self._method = method
         self._alpha_min = alpha_min
@@ -1583,6 +1604,7 @@ class Optimizer(object):
         self._rand_seed = rand_seed
         self._standardize = standardize
         self._fit_intercept = fit_intercept
+        self._alpha_auto = bool(alpha_auto)
 
         if alpha is not None:
             self._alpha = np.asarray(alpha, dtype=np.float64)
@@ -1653,7 +1675,8 @@ class Optimizer(object):
                 init_alpha=float(os.environ.get("PHEASY_ALASSO_RIDGE_ALPHA", "1e-3")),
                 eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
                 nalpha=self._nalpha,
-                decades=float(os.environ.get("PHEASY_ALPHA_DECADES", "4.0")))
+                decades=float(os.environ.get("PHEASY_ALPHA_DECADES", "4.0")),
+                alpha_auto=self._alpha_auto)
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "RFE":

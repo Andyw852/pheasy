@@ -56,8 +56,14 @@
 #    PHEASY_TSQR_CRITERION=  TSQR 判停: cv|bic|aic (默认 cv)
 #    PHEASY_BIC_N_EFF=      BIC/AIC 的有效观测: groups|samples (默认 groups=构型数)
 #    PHEASY_ALASSO_WEIGHTED_GRID= ALASSO 加权 alpha 网格 (默认 1)。
-#                           0=回退 mu_shift 经验网格; 1=KKT 阈值网格,
-#                           跨度>=8 个数量级以覆盖低正则化区 (P37)
+#                           1=加权 KKT 阈值网格 (推荐, P37/P38):
+#                           超定时自动下探到未加权阈值尺度, 格点数按跨度
+#                           自适应; 0=回退 mu_shift 经验网格 (历史可用,
+#                           不推荐)。注意: ALASSO 惩罚在加权空间, 手动网格
+#                           (--no-alpha_auto --mu_min/--mu_max) 是已知劣化
+#                           路径 -- 未加权尺度的网格会严重过正则化, 例如
+#                           MnIn2Se4 c3=5.2 n45 [1e-6,1e-2]: re 0.0063->0.077,
+#                           nnz 1223->375 (P38 起手动网格会被原样尊重)
 #
 #  示例：
 #    bash pheasy_fit.sh FIT_METHOD=OLS    C3_CUTOFF=5.2
