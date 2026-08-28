@@ -22,3 +22,6 @@ test/*/FORCE_CONSTANTS
 test/*/FORCE_CONSTANTS_3RD
 test/*/FORCE_CONSTANTS_4TH
 test/*/phi.npz
+
+# local-only agent notes with real GPU-box identifiers (never commit)
+AGENTS.local.md
