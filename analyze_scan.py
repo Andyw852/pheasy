@@ -132,6 +132,13 @@ def main():
                  r["fc3max"], r["dev3"], r.get("rel_err", float("nan")),
                  r.get("nnz", "-"), _nnzp, _cv, note))
 
+    # [FIX P43] right below the table: RMSE_CV is the L1 path's grouped-CV RMSE
+    # (pre-debias); the delivered IFC is a debiased (OLS) refit with no holdout
+    # number. Skip for OLS-only scans where the column is all "-".
+    if any(r.get("cv") is not None for r in rows):
+        print("\nnote: RMSE_CV is the L1 path's grouped-CV RMSE (pre-debias); the "
+              "delivered IFC is a debiased OLS refit with no holdout number.")
+
     if args.csv:
         import csv
         keys = ["method", "ndata", "relL2_fc2", "relL2_fc3", "fc3max", "dev3",
@@ -141,11 +148,6 @@ def main():
             w.writeheader()
             w.writerows(rows)
         print("\nCSV -> %s" % args.csv)
-
-    # [FIX P42] RMSE_CV is the L1 path's grouped-CV RMSE (pre-debias): the
-    # delivered IFC is a debiased (OLS) refit, which has no holdout number here.
-    print("\nnote: RMSE_CV is the L1 path's grouped-CV RMSE (pre-debias); the "
-          "delivered IFC is a debiased OLS refit with no holdout number.")
 
     # 达到 1% / 0.1% 三阶精度所需的最少构型数
     print("\n达到给定三阶精度所需的最少构型数：")

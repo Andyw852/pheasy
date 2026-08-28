@@ -1250,7 +1250,7 @@ class WorkFlow(object):
                             "alpha_opt %.3e is NEAR the LOW edge of the grid (not "
                             "pinned at the minimum); see the [CV] WARNING above "
                             "for the cause.", _aopt)
-                    elif _lg_a >= _lg_hi - 0.05 * _span:
+                    elif _lg_a >= _lg_hi - 0.05 * _span and not _at_min:
                         logger.warning(
                             "alpha_opt %.3e sits at the HIGH edge of the grid — "
                             "consider a higher grid.", _aopt)
