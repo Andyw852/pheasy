@@ -19,9 +19,12 @@ Usage:
 n-sweep note: the interesting sweep is the CROSSING point where L1 methods start
 to beat OLS, not the already-overdetermined 36/27/18. For MnIn2Se4 c3=7.0 (p=3678,
 567 rows/config) OLS becomes underdetermined only below ~8 configs, so sweep
---n-configs 12 9 6 to find where sparsification starts to pay off; that turns the
-conclusion from "L1 does nothing at n=45" into "sparse wins for n < X; n=45 is far
-beyond the threshold, so ALASSO degrading to OLS is a sign of sufficient data".
+--n-configs 24 18 12 9 6 (24/18 cover the overdetermined-but-ill-conditioned band;
+12/9/6 cover the underdetermined boundary). Include RIDGE as the control: only if
+ALASSO beats RIDGE (not just OLS) does SPARSITY (not mere regularization) pay off.
+For small n use --n-splits 3 and repeat with 2-3 --seed values (a single split of
+1-2 configs is noisy); read the median, not just the mean, since underdetermined
+OLS relL2 can blow up and dominate the mean.
 """
 import argparse
 import io
@@ -45,7 +48,8 @@ def _load_sm_f(d, n_configs, rows_per_config, sm_dtype):
     n_rows = n_configs * rows_per_config
     _dt = np.float32 if sm_dtype == "float32" else np.float64
     SM = np.asarray(SM[:n_rows].toarray(), dtype=_dt)
-    assert SM.shape[0] == n_rows, "SM has %d rows, expected %d" % (SM.shape[0], n_rows)
+    if SM.shape[0] != n_rows:
+        raise SystemExit("SM has %d rows, expected %d" % (SM.shape[0], n_rows))
     fm = np.load(os.path.join(d, "fm1d.npz"))
     key = "F" if "F" in fm else list(fm.keys())[0]
     F = np.asarray(fm[key], dtype=np.float64).ravel()[:n_rows]
@@ -53,18 +57,42 @@ def _load_sm_f(d, n_configs, rows_per_config, sm_dtype):
     return SM, F
 
 
+# [FIX] single source of truth for the fit settings: the summary header and the
+# actual Optimizer call must read the SAME dict, or the header silently drifts
+# from the run and becomes misinformation instead of a reproducibility record.
+FIT_KW = dict(nalpha=20, cv=5, tol=1e-6, max_iter=20000, alpha_auto=True,
+              decades=4.0)
+# [FIX] the RIDGE control must actually regularize. The default grid
+# [1e-6, 1e-2] on standardized columns is ~unregularized (RIDGE collapses to
+# OLS), which would make the "regularization vs sparsity" comparison useless.
+RIDGE_ALPHAS = np.logspace(-6, 4, 30)  # 1e-6 .. 1e4
+
+
 def _method_fit(method, A, y):
     from pheasy.core.optimizer import Optimizer
     std = method in ("LASSO", "ALASSO", "RIDGE")
-    o = Optimizer(method, nalpha=20, cv=5, tol=1e-6, max_iter=20000,
-                  rand_seed=0, standardize=std, alpha_auto=True, decades=4.0)
+    kw = dict(FIT_KW, rand_seed=0, standardize=std)
+    if method == "RIDGE":
+        kw["alpha"] = RIDGE_ALPHAS
+        kw["alpha_auto"] = False
+    o = Optimizer(method, **kw)
     import contextlib
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         o.fit(A, y)
-    flag = "A@MIN" if "grid MINIMUM" in buf.getvalue() else ""
+    flag = ""
+    if "grid MINIMUM" in buf.getvalue():
+        flag += "A@MIN"
+    if method == "RIDGE":
+        # same edge detection we spent many rounds giving ALASSO: the control is
+        # useless if CV picked a grid edge (wants outside the grid).
+        a = float(o._model.alpha_)
+        if a <= RIDGE_ALPHAS[0] * (1.0 + 1e-9):
+            flag += ("+" if flag else "") + "R@lo"
+        elif a >= RIDGE_ALPHAS[-1] * (1.0 - 1e-9):
+            flag += ("+" if flag else "") + "R@hi"
     # use the formal exit (o.results["coef"]) rather than o._model.coef_; the
-    # latter is fragile (depends on L1975 write-back which could be removed).
+    # latter is fragile (depends on a write-back that could be removed).
     return np.asarray(o.results["coef"], dtype=np.float64), flag
 
 
@@ -94,14 +122,15 @@ def main():
     # detector then returns None and the inner CV silently falls back to
     # row-random). Assert + announce so a grouped-CV failure cannot be silent.
     _gs = int(os.environ["PHEASY_CV_GROUP_SIZE"])
-    assert _gs == args.rows_per_config, (
-        "PHEASY_CV_GROUP_SIZE=%d overrides --rows-per-config=%d"
-        % (_gs, args.rows_per_config))
+    if _gs != args.rows_per_config:
+        raise SystemExit(
+            "PHEASY_CV_GROUP_SIZE=%d overrides --rows-per-config=%d"
+            % (_gs, args.rows_per_config))
     print("inner CV grouped by config (group_size=%d)" % _gs, flush=True)
     SM, F = _load_sm_f(args.data_dir, args.n_configs, args.rows_per_config,
                        args.sm_dtype)
-    print("settings: nmu=20 cv=5 tol=1e-6 max_iter=20000 alpha_decades=4.0 "
-          "standardize=L1/RIDGE sm_dtype=%s group_size=%d"
+    print("settings: " + " ".join("%s=%s" % kv for kv in FIT_KW.items())
+          + " standardize=L1/RIDGE sm_dtype=%s group_size=%d"
           % (args.sm_dtype, args.rows_per_config), flush=True)
     n_conf = args.n_configs
     rng = np.random.default_rng(args.seed)
@@ -132,20 +161,29 @@ def main():
             rel = float(np.linalg.norm(err) / np.linalg.norm(F[val]))
             res[m]["rmse"].append(rmse)
             res[m]["rel_l2"].append(rel)
-            res[m]["flag"].append(flag == "A@MIN")
+            res[m]["flag"].append(flag)
             print("    %-8s rmse=%.4e  relL2=%.4e  nnz=%d  %5s  (%.1fs)"
                   % (m, rmse, rel, int(np.count_nonzero(coef)), flag, time.time() - t0),
                   flush=True)
 
     print()
-    print("%-8s %12s %12s %12s %12s %8s" % ("method", "rmse_mean", "rmse_std",
-                                            "relL2_mean", "relL2_std", "A@MIN"))
+    print("%-8s %12s %12s %12s %12s %12s %8s" % ("method", "rmse_mean", "rmse_std",
+                                                 "relL2_mean", "relL2_std",
+                                                 "relL2_med", "A@MIN"))
     for m in methods:
         r = res[m]
-        amin = sum(1 for f in r["flag"] if f)
-        print("%-8s %12.4e %12.4e %12.4e %12.4e %5d/%d"
+        amin = sum(1 for f in r["flag"] if "A@MIN" in f)
+        print("%-8s %12.4e %12.4e %12.4e %12.4e %12.4e %5d/%d"
               % (m, np.mean(r["rmse"]), np.std(r["rmse"]),
-                 np.mean(r["rel_l2"]), np.std(r["rel_l2"]), amin, len(r["flag"])))
+                 np.mean(r["rel_l2"]), np.std(r["rel_l2"]),
+                 np.median(r["rel_l2"]), amin, len(r["flag"])))
+    # RIDGE control edge note (the control is useless if CV picked a grid edge)
+    if "RIDGE" in methods:
+        r = res["RIDGE"]
+        lo = sum(1 for f in r["flag"] if "R@lo" in f)
+        hi = sum(1 for f in r["flag"] if "R@hi" in f)
+        print("RIDGE selected alpha at grid edge in %d/%d folds (lo %d, hi %d)"
+              % (lo + hi, len(r["flag"]), lo, hi))
     # paired comparison: same fold, OLS vs each other method (relL2 difference)
     if "OLS" in methods and len(methods) > 1:
         print()
@@ -155,8 +193,9 @@ def main():
             if m == "OLS":
                 continue
             diff = ols_rel - np.array(res[m]["rel_l2"])
-            print("  OLS - %-8s: mean %.4e  std %.4e  (all %d folds: %s)"
-                  % (m, np.mean(diff), np.std(diff), len(diff),
+            favor = int(np.sum(diff < 0))
+            print("  OLS - %-8s: mean %.4e  std %.4e  (%d/%d folds favor OLS; all: %s)"
+                  % (m, np.mean(diff), np.std(diff), favor, len(diff),
                      " ".join("%.3e" % d for d in diff)))
 
 
