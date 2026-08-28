@@ -37,6 +37,7 @@ def _load_sm_f(d, n_configs, rows_per_config):
     SM = sm_prime @ NS
     n_rows = n_configs * rows_per_config
     SM = np.asarray(SM[:n_rows].toarray(), dtype=np.float64)
+    assert SM.shape[0] == n_rows, "SM has %d rows, expected %d" % (SM.shape[0], n_rows)
     fm = np.load(os.path.join(d, "fm1d.npz"))
     key = "F" if "F" in fm else list(fm.keys())[0]
     F = np.asarray(fm[key], dtype=np.float64).ravel()[:n_rows]
@@ -50,9 +51,13 @@ def _method_fit(method, A, y):
     o = Optimizer(method, nalpha=20, cv=5, tol=1e-6, max_iter=20000,
                   rand_seed=0, standardize=std, alpha_auto=True, decades=4.0)
     import contextlib
-    with contextlib.redirect_stdout(io.StringIO()):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
         o.fit(A, y)
-    return np.asarray(o._model.coef_, dtype=np.float64)
+    flag = "A@MIN" if "grid MINIMUM" in buf.getvalue() else ""
+    # use the formal exit (o.results["coef"]) rather than o._model.coef_; the
+    # latter is fragile (depends on L1975 write-back which could be removed).
+    return np.asarray(o.results["coef"], dtype=np.float64), flag
 
 
 def main():
@@ -66,13 +71,21 @@ def main():
     args = ap.parse_args()
 
     methods = args.methods.split()
+    # [FIX] the internal CV (for alpha selection / RFE feature count) must also
+    # be grouped by config; otherwise it leaks across correlated atom forces
+    # within one displacement -> biases alpha* low -> denser models -> result
+    # leans toward "L1 ≈ OLS", i.e. toward the conclusion we want to prove
+    # (審稿人會直接挑這點). rows_per_config = 3 × natoms exactly matches what
+    # run_pheasy sets, so the train fold (36 configs × 567 rows) divides evenly.
+    os.environ.setdefault("PHEASY_CV_GROUP_SIZE", str(args.rows_per_config))
     SM, F = _load_sm_f(args.data_dir, args.n_configs, args.rows_per_config)
     n_conf = args.n_configs
     rng = np.random.default_rng(args.seed)
     order = rng.permutation(n_conf)
-    fold = max(1, n_conf // args.n_splits)
-    folds = [order[i * fold:(i + 1) * fold] for i in range(args.n_splits)]
-    folds = [f for f in folds if len(f) > 0]
+    # array_split divides as evenly as possible (e.g. 18/5 -> [4,4,4,3,3]), whereas
+    # n_conf // n_splits drops the remainder (18/5 fold=3 covers only 15, silently
+    # leaves 3 configs never held out).
+    folds = [f for f in np.array_split(order, args.n_splits) if len(f) > 0]
 
     rpc = args.rows_per_config
     res = {m: {"rmse": [], "rel_l2": []} for m in methods}
@@ -84,17 +97,19 @@ def main():
         tr = ~val
         print("fold %d/%d: train %d conf, val %d conf"
               % (fi + 1, len(folds), n_conf - len(held), len(held)), flush=True)
+        A_tr, y_tr = SM[tr], F[tr]  # hoist the materialization out of the method loop
+        A_val = SM[val]
         for m in methods:
             t0 = time.time()
-            coef = _method_fit(m, SM[tr], F[tr])
-            pred = SM[val] @ coef
+            coef, flag = _method_fit(m, A_tr, y_tr)
+            pred = A_val @ coef
             err = pred - F[val]
             rmse = float(np.sqrt(np.mean(err * err)))
             rel = float(np.linalg.norm(err) / np.linalg.norm(F[val]))
             res[m]["rmse"].append(rmse)
             res[m]["rel_l2"].append(rel)
-            print("    %-8s rmse=%.4e  relL2=%.4e  nnz=%d  (%.1fs)"
-                  % (m, rmse, rel, int(np.count_nonzero(coef)), time.time() - t0),
+            print("    %-8s rmse=%.4e  relL2=%.4e  nnz=%d  %5s  (%.1fs)"
+                  % (m, rmse, rel, int(np.count_nonzero(coef)), flag, time.time() - t0),
                   flush=True)
 
     print()
@@ -105,6 +120,18 @@ def main():
         print("%-8s %12.4e %12.4e %12.4e %12.4e"
               % (m, np.mean(r["rmse"]), np.std(r["rmse"]),
                  np.mean(r["rel_l2"]), np.std(r["rel_l2"])))
+    # paired comparison: same fold, OLS vs each other method (relL2 difference)
+    if "OLS" in methods and len(methods) > 1:
+        print()
+        print("paired relL2 diff (OLS - method, negative = OLS better):")
+        ols_rel = np.array(res["OLS"]["rel_l2"])
+        for m in methods:
+            if m == "OLS":
+                continue
+            diff = ols_rel - np.array(res[m]["rel_l2"])
+            print("  OLS - %-8s: mean %.4e  std %.4e  (all %d folds: %s)"
+                  % (m, np.mean(diff), np.std(diff), len(diff),
+                     " ".join("%.3e" % d for d in diff)))
 
 
 if __name__ == "__main__":
