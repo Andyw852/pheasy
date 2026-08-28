@@ -37,11 +37,13 @@ running, not after):
   3. OLS - RIDGE should turn positive at small n if regularization starts paying
      off; if it stays ~0, even regularization has no benefit at reachable n, and
      the honest conclusion is "data sufficient at every reachable n".
-  4. At n <= 9 the ALASSO adaptive weights lose their adaptivity: the ridge pilot
-     is a near-min-norm solution whose magnitudes flatten, the weights go
-     uniform (std(log w) -> 0, flagged W<disp>), and ALASSO degenerates to plain
-     LASSO. Read the ALASSO vs LASSO columns at those n: if they collapse
-     (ALASSO - LASSO ~ 0), treat that row as LASSO, not as a sparsity result.
+  4. At n <= 9 the ALASSO adaptive weights may lose their adaptivity, but the
+     mechanism is NOT assumed: the underdetermined ridge pilot can flatten the
+     weights (W -> 0) or saturate them at the 1/eps ceiling (F -> 1) -- opposite
+     failure modes, both flagged per fold. The OPERATIVE test is the ALASSO -
+     LASSO paired row (--paired-refs 'OLS RIDGE' + the LASSO column): if it
+     collapses (ALASSO - LASSO ~ 0), read that row as LASSO, not as a sparsity
+     result. W/F explain WHY; they are not the test.
 """
 import argparse
 import io
@@ -98,6 +100,16 @@ def _method_fit(method, A, y):
     from pheasy.core.optimizer import Optimizer
     std = method in ("LASSO", "ALASSO", "RIDGE")
     kw = dict(FIT_KW, rand_seed=0, standardize=std)
+    if method == "LASSO":
+        # [FIX] holdout_eval constructs Optimizer directly (bypassing run_pheasy,
+        # the ONLY caller of derive_alpha_grid), so plain LASSO used to get the
+        # hardcoded logspace(-6,-2) grid -- an arbitrary scale that pins alpha*
+        # (under- or over-regularized depending on the data). Replicate run_pheasy:
+        # derive the grid from the data. standardize=True does its own column
+        # normalization, so pass the raw A.
+        from pheasy.core.optimizer import derive_alpha_grid
+        kw["alpha"] = derive_alpha_grid(A, y, nalpha=FIT_KW["nalpha"],
+                                        decades=FIT_KW["decades"], standardize=True)
     if method == "RIDGE":
         kw["alpha"] = RIDGE_BASE
         kw["alpha_auto"] = False
@@ -119,13 +131,17 @@ def _method_fit(method, A, y):
             flag += ("+" if flag else "") + "D%.1f" % float(
                 np.log10(_al.max() / _al.min()))
     if method == "ALASSO":
-        # [FIX] weight dispersion: at n<=9 the ridge pilot is a near-min-norm
-        # solution whose magnitudes flatten -> weights go uniform -> ALASSO
-        # degenerates to plain LASSO. std(log w) quantifies the adaptivity loss.
+        # [FIX] diagnostics for the adaptive-weight failure mode at small n:
+        # W = std(log w) (uniform -> 0), F = fraction of pilot coefficients at the
+        # eps floor (saturating weights at the 1/eps ceiling). They are WHY, not
+        # the test: the operative test is the ALASSO - LASSO paired row.
         _w = getattr(o._model, "_weights", None)
         if _w is not None:
             flag += ("+" if flag else "") + "W%.2f" % float(
                 np.std(np.log(np.maximum(np.asarray(_w), 1e-300))))
+        _bf = getattr(o._model, "_beta0_floor", None)
+        if _bf is not None:
+            flag += ("+" if flag else "") + "F%.2f" % float(_bf)
     if method == "RIDGE":
         # same edge detection we spent many rounds giving ALASSO: the control is
         # useless if CV picked a grid edge (wants outside the grid).

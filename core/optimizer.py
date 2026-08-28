@@ -1315,6 +1315,12 @@ class _AdaptiveLassoCV(_LassoCVModel):
         n_samples = A.shape[0]
         beta0 = self._initial_estimate(A, y)
         self._weights = 1.0 / (np.abs(beta0) + self.eps) ** self.gamma
+        # [FIX] eps-floor fraction: the fraction of pilot coefficients at/below
+        # eps. Underdetermined ridge pilots can either FLATTEN (weights ~uniform)
+        # or SATURATE at the 1/eps ceiling -- two opposite failure modes that a
+        # single weight-dispersion number cannot separate. 0.0 = flattened,
+        # ~1.0 = most weights pinned at the 1/eps ceiling.
+        self._beta0_floor = float(np.mean(np.abs(beta0) < self.eps))
 
         # [FIX P35] derive the alpha grid in the WEIGHTED space:
         # (A/w)^T y = (A^T y)/w, so alpha_max = max_j |(A^T y)_j / w_j| / n.
