@@ -1407,36 +1407,46 @@ class _AdaptiveLassoCV(_LassoCVModel):
                           "(%d alphas, %.2f decades, step %.2fx)"
                           % (_lo, _hi, _n, _span,
                              10.0 ** (_span / max(_n - 1, 1))), flush=True)
-        elif _manual and self.alphas.size > 1 and _a_max > 0:
-            # [FIX P40] manual grid (--no-alpha_auto): used AS-IS, but say how far
-            # off the weighted scale it is. A manual grid in the UNWEIGHTED scale
-            # over-regularizes ALASSO because the penalty lives in A/w space (the
-            # weights reach 1/eps ~ 1e8), so alpha* gets pinned to the grid bottom
-            # (known degradation: MnIn2Se4 c3=5.2 n45 [1e-6,1e-2] -> re 0.077,
-            # nnz 375 vs the weighted grid's re 0.0063, nnz 1223).
+        elif _manual and self.alphas.size > 1:
+            # [FIX P40/P44/P45] manual grid (--no-alpha_auto): used AS-IS, but
+            # ALWAYS report the weighted scale so even a well-scaled manual grid
+            # leaves an auditable record, and diagnose the two real mismatch modes:
+            # (a) the ENTIRE grid is below the weighted KKT threshold (no point
+            # regularizes); (b) the grid BOTTOM is far above where the auto grid
+            # starts (never reaches the under-regularized regime). Both pin alpha*
+            # to the bottom; whether the fit is actually over-regularized depends
+            # on the data (the [1e-2,1e2] case can recover the true support).
             _lo_m = float(self.alphas.min())
             _hi_m = float(self.alphas.max())
-            _a_uw = float(_g_raw.max()) / n_samples
-            _auto_lo = min(_a_max, _a_uw) * 10.0 ** -max(self.decades, 6.0)
-            if _hi_m < _a_max:
-                _grid_diag = ("the ENTIRE grid lies below the weighted KKT "
-                              "threshold (%.3e): no grid point regularizes at "
-                              "all -- the GRID, not the data, pins alpha*. Drop "
-                              "--no-alpha_auto and use the weighted auto grid."
-                              % _a_max)
-            elif _lo_m > _auto_lo * 10.0:
-                _grid_diag = ("the grid BOTTOM (%.3e) is %.1f decades ABOVE "
-                              "where the auto grid starts (%.3e): it never "
-                              "reaches the under-regularized regime, so alpha* "
-                              "pins low and the fit is OVER-regularized. Drop "
-                              "--no-alpha_auto and use the weighted auto grid."
-                              % (_lo_m, np.log10(_lo_m / _auto_lo), _auto_lo))
+            if _a_max > 0:
+                _a_uw = float(_g_raw.max()) / n_samples
+                _auto_lo = min(_a_max, _a_uw) * 10.0 ** -max(self.decades, 6.0)
+                if _hi_m < _a_max:
+                    _grid_diag = ("the ENTIRE grid lies below the weighted KKT "
+                                  "threshold (%.3e): no grid point regularizes at "
+                                  "all -- the GRID, not the data, pins alpha*. Drop "
+                                  "--no-alpha_auto and use the weighted auto grid."
+                                  % _a_max)
+                elif _lo_m > _auto_lo * 10.0:
+                    _grid_diag = ("the grid BOTTOM (%.3e) is %.1f decades ABOVE "
+                                  "where the auto grid starts (%.3e): alpha* is "
+                                  "pinned by the grid bottom rather than chosen by "
+                                  "CV; the fit MAY be over-regularized (MnIn2Se4 "
+                                  "c3=5.2 n45 on this path: nnz 375 vs 1224 on the "
+                                  "auto grid). Drop --no-alpha_auto and use the "
+                                  "weighted auto grid."
+                                  % (_lo_m, np.log10(_lo_m / _auto_lo), _auto_lo))
+                else:
+                    _grid_diag = None
+                print("[ALASSO] manual alpha grid [%.3e .. %.3e] used AS-IS; "
+                      "weighted KKT threshold %.3e, auto grid would start at "
+                      "%.3e.%s" % (_lo_m, _hi_m, _a_max, _auto_lo,
+                                   (" " + _grid_diag) if _grid_diag else ""),
+                      flush=True)
             else:
-                _grid_diag = None
-            self._grid_diag = _grid_diag
-            if _grid_diag is not None:
-                print("[ALASSO] manual alpha grid [%.3e .. %.3e] used AS-IS; %s"
-                      % (_lo_m, _hi_m, _grid_diag), flush=True)
+                print("[ALASSO] manual alpha grid [%.3e .. %.3e] used AS-IS "
+                      "(scale diagnostic off: PHEASY_ALASSO_GRID_DIAG=0)."
+                      % (_lo_m, _hi_m), flush=True)
         elif _mu_shift and self.alphas.size > 1:
             # [FIX P40] mu_shift-auto grid (PHEASY_ALASSO_WEIGHTED_GRID=0 with
             # alpha_auto): run_pheasy already did the rmatvec to derive it, so no
