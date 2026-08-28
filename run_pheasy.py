@@ -1238,12 +1238,18 @@ class WorkFlow(object):
                     _lg_hi = float(np.log10(_grid[-1]))
                     _lg_a = float(np.log10(_aopt))
                     _span = max(_lg_hi - _lg_lo, 1e-12)
-                    if _lg_a <= _lg_lo + 0.05 * _span:
+                    # [FIX P42] the optimizer's own warning (in _reselect_alpha /
+                    # _LassoCVIterative) already reports the exact grid-MINIMUM case
+                    # with the CORRECT cause (flat-tail tie vs still-falling curve).
+                    # run_pheasy does not have that info, so only add a note for the
+                    # NEAR-edge case (within the 5% band but not pinned), and do not
+                    # assert a cause there.
+                    _at_min = bool(getattr(optimizer._model, "_alpha_at_min", False))
+                    if _lg_a <= _lg_lo + 0.05 * _span and not _at_min:
                         logger.warning(
-                            "alpha_opt %.3e sits at the LOW edge of the grid — "
-                            "the CV curve is still falling at the low end; treat "
-                            "this fit as effectively unregularized (compare with "
-                            "OLS/RFE), not as a converged interior optimum.", _aopt)
+                            "alpha_opt %.3e is NEAR the LOW edge of the grid (not "
+                            "pinned at the minimum); see the [CV] WARNING above "
+                            "for the cause.", _aopt)
                     elif _lg_a >= _lg_hi - 0.05 * _span:
                         logger.warning(
                             "alpha_opt %.3e sits at the HIGH edge of the grid — "

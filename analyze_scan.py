@@ -135,12 +135,17 @@ def main():
     if args.csv:
         import csv
         keys = ["method", "ndata", "relL2_fc2", "relL2_fc3", "fc3max", "dev3",
-                "rel_err", "nnz", "cv", "alpha", "nnz_p"]
+                "rel_err", "nnz", "cv", "alpha", "nnz_p", "tie", "atmin"]
         with open(args.csv, "w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=keys, extrasaction="ignore")
             w.writeheader()
             w.writerows(rows)
         print("\nCSV -> %s" % args.csv)
+
+    # [FIX P42] RMSE_CV is the L1 path's grouped-CV RMSE (pre-debias): the
+    # delivered IFC is a debiased (OLS) refit, which has no holdout number here.
+    print("\nnote: RMSE_CV is the L1 path's grouped-CV RMSE (pre-debias); the "
+          "delivered IFC is a debiased OLS refit with no holdout number.")
 
     # 达到 1% / 0.1% 三阶精度所需的最少构型数
     print("\n达到给定三阶精度所需的最少构型数：")

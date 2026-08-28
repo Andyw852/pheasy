@@ -838,18 +838,22 @@ def _reselect_alpha(model, A, y, sample_weight=None):
               "--max_iter, otherwise the fit is over-regularized."
               % (tied.size, best, float(alphas[tied].min()),
                  float(alphas[tied].max())), flush=True)
-    # [FIX P39/P41] alpha* pinned to the grid MINIMUM has two very different
+    # [FIX P39/P41/P42] alpha* pinned to the grid MINIMUM has two very different
     # causes: (a) the tie-break on a FLAT CV tail landed on the smallest alpha --
     # a CONVERGENCE problem; (b) the CV curve is genuinely still falling at the
     # low end -- a model-density conclusion (treat as unregularized / compare OLS).
-    if new_alpha <= float(alphas.min()) * (1.0 + 1e-12):
-        _flat = (tied.size > 1
-                 and float(alphas[tied].min()) <= float(alphas.min()) * (1.0 + 1e-12))
-        if _flat:
+    # Stash both flags on the sklearn model so run_pheasy can DEFER instead of
+    # re-asserting a cause it does not have access to.
+    model._alpha_at_min = new_alpha <= float(alphas.min()) * (1.0 + 1e-12)
+    model._alpha_at_min_flat = (
+        model._alpha_at_min and tied.size > 1
+        and float(alphas[tied].min()) <= float(alphas.min()) * (1.0 + 1e-12))
+    if model._alpha_at_min:
+        if model._alpha_at_min_flat:
             print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM via the "
                   "tie-break on a FLAT CV tail; this is a CONVERGENCE problem "
-                  "(tighten PHEASY_CV_TOL / --tol), not a model-density conclusion."
-                  % new_alpha, flush=True)
+                  "(lower --tol (1e-6) and/or raise --max_iter), not a model-"
+                  "density conclusion." % new_alpha, flush=True)
         else:
             print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV curve "
                   "is still falling at the low end, so widening the grid only pushes "
@@ -1097,17 +1101,20 @@ class _LassoCVIterative:
                   % (tied.size, best_mean, float(self.alphas[tied].min()),
                      float(self.alphas[tied].max()), cv_tol, cv_max_iter),
                   flush=True)
-        # [FIX P39/P41] best_i == 0 is the SMALLEST alpha (the grid walks
+        # [FIX P39/P41/P42] best_i == 0 is the SMALLEST alpha (the grid walks
         # descending). Distinguish a flat-tail tie-break (CONVERGENCE problem)
         # from a genuinely still-falling CV curve (model-density conclusion).
-        if best_i == 0:
-            _flat = (tied.size > 1
-                     and float(self.alphas[tied].min()) <= float(self.alphas.min()) * (1.0 + 1e-12))
-            if _flat:
+        # Stash the flags so run_pheasy can defer instead of re-asserting a cause.
+        self._alpha_at_min = (best_i == 0)
+        self._alpha_at_min_flat = (
+            self._alpha_at_min and tied.size > 1
+            and float(self.alphas[tied].min()) <= float(self.alphas.min()) * (1.0 + 1e-12))
+        if self._alpha_at_min:
+            if self._alpha_at_min_flat:
                 print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM via the "
                       "tie-break on a FLAT CV tail; this is a CONVERGENCE problem "
-                      "(tighten PHEASY_CV_TOL / --tol), not a model-density "
-                      "conclusion." % float(self.alphas[0]), flush=True)
+                      "(lower PHEASY_CV_TOL / raise PHEASY_CV_MAX_ITER), not a "
+                      "model-density conclusion." % float(self.alphas[0]), flush=True)
             else:
                 print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV "
                       "curve is still falling at the low end, so widening the grid "
@@ -1170,6 +1177,8 @@ class _LassoCVModel:
             self.mse_path_ = it.mse_path_
             self.n_iter_ = it.n_iter_
             self.n_features_in_ = it.n_features_in_
+            self._alpha_at_min = getattr(it, "_alpha_at_min", False)
+            self._alpha_at_min_flat = getattr(it, "_alpha_at_min_flat", False)
             return self
 
         n_samples = A.shape[0]
@@ -1194,6 +1203,8 @@ class _LassoCVModel:
         self.mse_path_ = np.asarray(model.mse_path_)
         self.n_iter_ = int(model.n_iter_)
         self.n_features_in_ = A.shape[1]
+        self._alpha_at_min = getattr(model, "_alpha_at_min", False)
+        self._alpha_at_min_flat = getattr(model, "_alpha_at_min_flat", False)
         return self
 
     def predict(self, A):
@@ -1369,6 +1380,8 @@ class _AdaptiveLassoCV(_LassoCVModel):
             self.mse_path_ = it.mse_path_
             self.n_iter_ = it.n_iter_
             self.n_features_in_ = A.shape[1]
+            self._alpha_at_min = getattr(it, "_alpha_at_min", False)
+            self._alpha_at_min_flat = getattr(it, "_alpha_at_min_flat", False)
             return self
 
         A_scaled = _scale_columns(A, self._weights)
@@ -1393,6 +1406,8 @@ class _AdaptiveLassoCV(_LassoCVModel):
         self.mse_path_ = np.asarray(model.mse_path_)
         self.n_iter_ = int(model.n_iter_)
         self.n_features_in_ = A.shape[1]
+        self._alpha_at_min = getattr(model, "_alpha_at_min", False)
+        self._alpha_at_min_flat = getattr(model, "_alpha_at_min_flat", False)
         return self
 
     def predict(self, A):
