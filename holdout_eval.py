@@ -28,15 +28,24 @@ OLS relL2 can blow up and dominate the mean.
 
 Acceptance criteria for an n-sweep row to be usable (write these down BEFORE
 running, not after):
-  1. RIDGE R@lo/R@hi == 0/k at that n; otherwise the row is grid-limited and the
-     ALASSO-vs-RIDGE comparison is invalid -- widen the grid and re-run that n.
+  1. RIDGE R@hi > 0 voids the row: the CV optimum is grid-limited on the HIGH
+     side (the true optimum may lie beyond the grid and be missed), so the
+     RIDGE baseline is an upper bound and the L1-vs-RIDGE gap is inflated.
+     R@lo is self-evidently harmless WHEN RIDGE == OLS in the table (the a->0
+     limit is already present, so truncating the grid bottom costs nothing).
+     R@lo only needs an extended-grid certification when RIDGE != OLS at that n
+     (the a->0 limit is then NOT in the table); ridge_cert.py does exactly that.
   2. The conclusion row is RIDGE - ALASSO (--paired-refs 'OLS RIDGE'): only
      0/k folds favor RIDGE (i.e. ALASSO <= RIDGE on every fold) supports real
      sparsity at that n. (The output prints "k/k folds favor RIDGE" with
      favor = sum(diff < 0), so the acceptance test is favor == 0.)
-  3. OLS - RIDGE should turn positive at small n if regularization starts paying
-     off; if it stays ~0, even regularization has no benefit at reachable n, and
-     the honest conclusion is "data sufficient at every reachable n".
+  3. OLS - RIDGE turning positive at small n is CONFOUNDED: underdetermined OLS
+     here is the un-regularized minimum-norm solution (scipy.linalg.lstsq
+     cond=None on a float32 rank-deficient matrix), which inverts spurious
+     ~3e-10 singular values (float32 rounding in the null directions) and blows
+     up (relL2 ~ 10). That +gap measures "regularization fixes ill-posedness",
+     not a clean "regularization pays off" signal. RIDGE (not OLS) is the honest
+     baseline; the decisive row is RIDGE - L1 (criterion 2), which is unaffected.
   4. At n <= 9 the ALASSO adaptive weights may lose their adaptivity, but the
      mechanism is NOT assumed: the underdetermined ridge pilot can flatten the
      weights (W -> 0) or saturate them at the 1/eps ceiling (F -> 1) -- opposite
