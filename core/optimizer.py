@@ -838,15 +838,23 @@ def _reselect_alpha(model, A, y, sample_weight=None):
               "--max_iter, otherwise the fit is over-regularized."
               % (tied.size, best, float(alphas[tied].min()),
                  float(alphas[tied].max())), flush=True)
-    # [FIX P39] alpha* pinned to the grid MINIMUM means the CV curve is still
-    # falling at the low end (the optimum lies outside the grid) -- report it,
-    # otherwise the fit looks like a converged interior optimum when it is
-    # really just "the least regularization the grid would allow".
+    # [FIX P39/P41] alpha* pinned to the grid MINIMUM has two very different
+    # causes: (a) the tie-break on a FLAT CV tail landed on the smallest alpha --
+    # a CONVERGENCE problem; (b) the CV curve is genuinely still falling at the
+    # low end -- a model-density conclusion (treat as unregularized / compare OLS).
     if new_alpha <= float(alphas.min()) * (1.0 + 1e-12):
-        print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV curve is "
-              "still falling at the low end, so widening the grid only pushes alpha* "
-              "toward OLS. Treat this fit as effectively unregularized (compare with "
-              "OLS/RFE)." % new_alpha, flush=True)
+        _flat = (tied.size > 1
+                 and float(alphas[tied].min()) <= float(alphas.min()) * (1.0 + 1e-12))
+        if _flat:
+            print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM via the "
+                  "tie-break on a FLAT CV tail; this is a CONVERGENCE problem "
+                  "(tighten PHEASY_CV_TOL / --tol), not a model-density conclusion."
+                  % new_alpha, flush=True)
+        else:
+            print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV curve "
+                  "is still falling at the low end, so widening the grid only pushes "
+                  "alpha* toward OLS. Treat this fit as effectively unregularized "
+                  "(compare with OLS/RFE)." % new_alpha, flush=True)
     if new_alpha == float(model.alpha_):
         return
     print("[CV] alpha reselected: %.6e -> %.6e" % (float(model.alpha_), new_alpha),
@@ -1089,14 +1097,23 @@ class _LassoCVIterative:
                   % (tied.size, best_mean, float(self.alphas[tied].min()),
                      float(self.alphas[tied].max()), cv_tol, cv_max_iter),
                   flush=True)
-        # [FIX P39] best_i == 0 is the SMALLEST alpha (the grid walks descending);
-        # the CV curve is still falling there, so the optimum is outside the grid.
+        # [FIX P39/P41] best_i == 0 is the SMALLEST alpha (the grid walks
+        # descending). Distinguish a flat-tail tie-break (CONVERGENCE problem)
+        # from a genuinely still-falling CV curve (model-density conclusion).
         if best_i == 0:
-            print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV "
-                  "curve is still falling at the low end, so widening the grid "
-                  "only pushes alpha* toward OLS. Treat this fit as effectively "
-                  "unregularized (compare with OLS/RFE)."
-                  % float(self.alphas[0]), flush=True)
+            _flat = (tied.size > 1
+                     and float(self.alphas[tied].min()) <= float(self.alphas.min()) * (1.0 + 1e-12))
+            if _flat:
+                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM via the "
+                      "tie-break on a FLAT CV tail; this is a CONVERGENCE problem "
+                      "(tighten PHEASY_CV_TOL / --tol), not a model-density "
+                      "conclusion." % float(self.alphas[0]), flush=True)
+            else:
+                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV "
+                      "curve is still falling at the low end, so widening the grid "
+                      "only pushes alpha* toward OLS. Treat this fit as effectively "
+                      "unregularized (compare with OLS/RFE)."
+                      % float(self.alphas[0]), flush=True)
 
         self.alpha_ = float(self.alphas[best_i])
         # final refit at the chosen alpha, warm-started from the path. Cap the

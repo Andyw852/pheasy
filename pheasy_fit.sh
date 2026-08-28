@@ -37,7 +37,9 @@
 #  │ 【正则化 / CV】                                                      │
 #  │   CV             CV 折数 (按构型分组)            (默认 5)           │
 #  │   NMU            alpha/ridge 网格点数           (默认 20)           │
+#  │                  (也决定 ALASSO 默认密度 (nmu-1)/4/decade)          │
 #  │   ALPHA_DECADES  alpha_auto 网格跨度(数量级)    (默认 4.0)         │
+#  │                  (ALASSO 超定分支有 max(decades,6) 下限)             │
 #  │   MU_MIN/MU_MAX  RIDGE 手动网格 10^min..10^max  (默认 -6/-2)       │
 #  │ 【内存 / 并行】                                                      │
 #  │   SM_DTYPE       sensing matrix 精度 float32/64 (默认 float32)     │
@@ -56,14 +58,19 @@
 #    PHEASY_TSQR_CRITERION=  TSQR 判停: cv|bic|aic (默认 cv)
 #    PHEASY_BIC_N_EFF=      BIC/AIC 的有效观测: groups|samples (默认 groups=构型数)
 #    PHEASY_ALASSO_WEIGHTED_GRID= ALASSO 加权 alpha 网格 (默认 1)。
-#                           1=加权 KKT 阈值网格 (推荐, P37/P38):
-#                           超定时自动下探到未加权阈值尺度, 格点数按跨度
-#                           自适应; 0=回退 mu_shift 经验网格 (历史可用,
-#                           不推荐)。注意: ALASSO 惩罚在加权空间, 手动网格
+#                           1=加权 KKT 阈值网格 (推荐, P37/P38/P40):
+#                           超定时自动下探到未加权阈值尺度, 密度每 decade
+#                           固定 (PHEASY_ALPHA_PER_DECADE); 0=回退 mu_shift
+#                           经验网格 (历史可用, 不推荐)。注意: ALASSO 惩罚
+#                           在加权空间, 手动网格
 #                           (--no-alpha_auto --mu_min/--mu_max) 是已知劣化
 #                           路径 -- 未加权尺度的网格会严重过正则化, 例如
 #                           MnIn2Se4 c3=5.2 n45 [1e-6,1e-2]: re 0.0063->0.077,
 #                           nnz 1223->375 (P38 起手动网格会被原样尊重)
+#    PHEASY_ALPHA_PER_DECADE ALASSO 加权网格每 decade 格点数 (默认 (nmu-1)/4)
+#    PHEASY_ALPHA_NMAX=       ALASSO 加权网格格点数硬上限 (默认 200)
+#    PHEASY_ALASSO_GRID_DIAG= 手动网格尺度假错配诊断 rmatvec (默认 1, 仅
+#                              --no-alpha_auto 路径生效)
 #
 #  示例：
 #    bash pheasy_fit.sh FIT_METHOD=OLS    C3_CUTOFF=5.2

@@ -59,6 +59,8 @@ def parse_log(d, m, n):
                 info["cv"] = float(line.rsplit(":", 1)[1].split()[0])
             elif "alphas tie at CV MSE" in line:
                 info["tie"] = True
+            elif "sits at the grid MINIMUM" in line:
+                info["atmin"] = True
     return info
 
 
@@ -109,19 +111,26 @@ def main():
                              fc3max=a3, dev3=(a3 - r3) / r3 * 100 if r3 else np.nan,
                              **info))
 
-    hdr = ("%-14s %5s %11s %11s %9s %9s %10s %6s %6s %s"
+    hdr = ("%-14s %5s %11s %11s %9s %9s %10s %6s %6s %10s %s"
            % ("method", "ndata", "relL2_fc2", "relL2_fc3", "fc3max", "dev3%",
-              "rel_err", "nnz", "nnz/p", "note"))
+              "rel_err", "nnz", "nnz/p", "RMSE_CV", "note"))
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
-        note = "TIE!" if r.get("tie") else ""
+        _note = []
+        if r.get("tie"):
+            _note.append("TIE!")
+        if r.get("atmin"):
+            _note.append("A@MIN!")
+        note = "+".join(_note)
         _nnzp = ("%.2f" % r["nnz_p"]) if (r.get("nnz_p") is not None
                                           and np.isfinite(r["nnz_p"])) else "-"
-        print("%-14s %5d %11.3e %11.3e %9.4f %9.3f %10.6f %6s %6s %s"
+        _cv = ("%.4e" % r["cv"]) if (r.get("cv") is not None
+                                     and np.isfinite(r["cv"])) else "-"
+        print("%-14s %5d %11.3e %11.3e %9.4f %9.3f %10.6f %6s %6s %10s %s"
               % (r["method"], r["ndata"], r["relL2_fc2"], r["relL2_fc3"],
                  r["fc3max"], r["dev3"], r.get("rel_err", float("nan")),
-                 r.get("nnz", "-"), _nnzp, note))
+                 r.get("nnz", "-"), _nnzp, _cv, note))
 
     if args.csv:
         import csv

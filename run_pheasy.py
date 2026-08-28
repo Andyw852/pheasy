@@ -1241,8 +1241,9 @@ class WorkFlow(object):
                     if _lg_a <= _lg_lo + 0.05 * _span:
                         logger.warning(
                             "alpha_opt %.3e sits at the LOW edge of the grid — "
-                            "the data may be overdetermined; consider OLS or a "
-                            "lower grid.", _aopt)
+                            "the CV curve is still falling at the low end; treat "
+                            "this fit as effectively unregularized (compare with "
+                            "OLS/RFE), not as a converged interior optimum.", _aopt)
                     elif _lg_a >= _lg_hi - 0.05 * _span:
                         logger.warning(
                             "alpha_opt %.3e sits at the HIGH edge of the grid — "

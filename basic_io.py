@@ -559,9 +559,10 @@ class InputParser(argparse.ArgumentParser):
             action="store",
             default=50,
             type=int,
-            help="""Only valid when MODEL='LASSO'. Number of alpha values
-                    used in cross-validation of LASSO to find the optimal
-                    alpha.""",
+            help="""Only valid when MODEL='LASSO' or 'ALASSO'. Number of alpha
+                    values used in cross-validation to find the optimal alpha;
+                    for the ALASSO weighted grid it also sets the default
+                    per-decade density (nmu-1)/4.""",
         )
         self.add_argument(
             "--alpha_auto",
