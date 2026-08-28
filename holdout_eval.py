@@ -15,6 +15,13 @@ estimate, whereas this measures the DELIVERED (debiased) model on unseen configs
 Usage:
     python3 holdout_eval.py <data_dir> --methods "OLS LASSO ALASSO RFE" \
         --n-configs 45 --n-splits 5 [--rows-per-config 567] [--seed 0]
+
+n-sweep note: the interesting sweep is the CROSSING point where L1 methods start
+to beat OLS, not the already-overdetermined 36/27/18. For MnIn2Se4 c3=7.0 (p=3678,
+567 rows/config) OLS becomes underdetermined only below ~8 configs, so sweep
+--n-configs 12 9 6 to find where sparsification starts to pay off; that turns the
+conclusion from "L1 does nothing at n=45" into "sparse wins for n < X; n=45 is far
+beyond the threshold, so ALASSO degrading to OLS is a sign of sufficient data".
 """
 import argparse
 import io
@@ -28,7 +35,7 @@ from scipy import sparse as sp
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _load_sm_f(d, n_configs, rows_per_config):
+def _load_sm_f(d, n_configs, rows_per_config, sm_dtype):
     t0 = time.time()
     sm_prime = sp.load_npz(os.path.join(d, "sm_prime.npz"))
     ns_harm = sp.load_npz(os.path.join(d, "ns_harm.npz"))
@@ -36,7 +43,8 @@ def _load_sm_f(d, n_configs, rows_per_config):
     NS = sp.block_diag([ns_harm, ns_anh], format="csr")
     SM = sm_prime @ NS
     n_rows = n_configs * rows_per_config
-    SM = np.asarray(SM[:n_rows].toarray(), dtype=np.float64)
+    _dt = np.float32 if sm_dtype == "float32" else np.float64
+    SM = np.asarray(SM[:n_rows].toarray(), dtype=_dt)
     assert SM.shape[0] == n_rows, "SM has %d rows, expected %d" % (SM.shape[0], n_rows)
     fm = np.load(os.path.join(d, "fm1d.npz"))
     key = "F" if "F" in fm else list(fm.keys())[0]
@@ -68,6 +76,9 @@ def main():
     ap.add_argument("--n-splits", type=int, default=5)
     ap.add_argument("--rows-per-config", type=int, default=567)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--sm-dtype", default=os.environ.get("PHEASY_SM_DTYPE", "float64"),
+                    help="sensing-matrix precision; mirrors PHEASY_SM_DTYPE so the "
+                         "holdout describes the same numerical path as the scan")
     args = ap.parse_args()
 
     methods = args.methods.split()
@@ -75,10 +86,23 @@ def main():
     # be grouped by config; otherwise it leaks across correlated atom forces
     # within one displacement -> biases alpha* low -> denser models -> result
     # leans toward "L1 ≈ OLS", i.e. toward the conclusion we want to prove
-    # (審稿人會直接挑這點). rows_per_config = 3 × natoms exactly matches what
-    # run_pheasy sets, so the train fold (36 configs × 567 rows) divides evenly.
+    # (a reviewer would call this out). rows_per_config = 3 × natoms exactly
+    # matches what run_pheasy sets, so the train fold divides evenly.
     os.environ.setdefault("PHEASY_CV_GROUP_SIZE", str(args.rows_per_config))
-    SM, F = _load_sm_f(args.data_dir, args.n_configs, args.rows_per_config)
+    # [FIX] the setdefault above is silent if the env var was already set to a
+    # different value (it would not override) or if n_samples % gs != 0 (the
+    # detector then returns None and the inner CV silently falls back to
+    # row-random). Assert + announce so a grouped-CV failure cannot be silent.
+    _gs = int(os.environ["PHEASY_CV_GROUP_SIZE"])
+    assert _gs == args.rows_per_config, (
+        "PHEASY_CV_GROUP_SIZE=%d overrides --rows-per-config=%d"
+        % (_gs, args.rows_per_config))
+    print("inner CV grouped by config (group_size=%d)" % _gs, flush=True)
+    SM, F = _load_sm_f(args.data_dir, args.n_configs, args.rows_per_config,
+                       args.sm_dtype)
+    print("settings: nmu=20 cv=5 tol=1e-6 max_iter=20000 alpha_decades=4.0 "
+          "standardize=L1/RIDGE sm_dtype=%s group_size=%d"
+          % (args.sm_dtype, args.rows_per_config), flush=True)
     n_conf = args.n_configs
     rng = np.random.default_rng(args.seed)
     order = rng.permutation(n_conf)
@@ -88,7 +112,7 @@ def main():
     folds = [f for f in np.array_split(order, args.n_splits) if len(f) > 0]
 
     rpc = args.rows_per_config
-    res = {m: {"rmse": [], "rel_l2": []} for m in methods}
+    res = {m: {"rmse": [], "rel_l2": [], "flag": []} for m in methods}
 
     for fi, held in enumerate(folds):
         val = np.zeros(SM.shape[0], dtype=bool)
@@ -108,18 +132,20 @@ def main():
             rel = float(np.linalg.norm(err) / np.linalg.norm(F[val]))
             res[m]["rmse"].append(rmse)
             res[m]["rel_l2"].append(rel)
+            res[m]["flag"].append(flag == "A@MIN")
             print("    %-8s rmse=%.4e  relL2=%.4e  nnz=%d  %5s  (%.1fs)"
                   % (m, rmse, rel, int(np.count_nonzero(coef)), flag, time.time() - t0),
                   flush=True)
 
     print()
-    print("%-8s %12s %12s %12s %12s" % ("method", "rmse_mean", "rmse_std",
-                                        "relL2_mean", "relL2_std"))
+    print("%-8s %12s %12s %12s %12s %8s" % ("method", "rmse_mean", "rmse_std",
+                                            "relL2_mean", "relL2_std", "A@MIN"))
     for m in methods:
         r = res[m]
-        print("%-8s %12.4e %12.4e %12.4e %12.4e"
+        amin = sum(1 for f in r["flag"] if f)
+        print("%-8s %12.4e %12.4e %12.4e %12.4e %5d/%d"
               % (m, np.mean(r["rmse"]), np.std(r["rmse"]),
-                 np.mean(r["rel_l2"]), np.std(r["rel_l2"])))
+                 np.mean(r["rel_l2"]), np.std(r["rel_l2"]), amin, len(r["flag"])))
     # paired comparison: same fold, OLS vs each other method (relL2 difference)
     if "OLS" in methods and len(methods) > 1:
         print()
