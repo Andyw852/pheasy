@@ -30,11 +30,18 @@ Acceptance criteria for an n-sweep row to be usable (write these down BEFORE
 running, not after):
   1. RIDGE R@lo/R@hi == 0/k at that n; otherwise the row is grid-limited and the
      ALASSO-vs-RIDGE comparison is invalid -- widen the grid and re-run that n.
-  2. The conclusion row is RIDGE - ALASSO sign count (--paired-refs 'OLS RIDGE'):
-     only k/k folds all positive (ALASSO better) supports real sparsity at that n.
+  2. The conclusion row is RIDGE - ALASSO (--paired-refs 'OLS RIDGE'): only
+     0/k folds favor RIDGE (i.e. ALASSO <= RIDGE on every fold) supports real
+     sparsity at that n. (The output prints "k/k folds favor RIDGE" with
+     favor = sum(diff < 0), so the acceptance test is favor == 0.)
   3. OLS - RIDGE should turn positive at small n if regularization starts paying
      off; if it stays ~0, even regularization has no benefit at reachable n, and
      the honest conclusion is "data sufficient at every reachable n".
+  4. At n <= 9 the ALASSO adaptive weights lose their adaptivity: the ridge pilot
+     is a near-min-norm solution whose magnitudes flatten, the weights go
+     uniform (std(log w) -> 0, flagged W<disp>), and ALASSO degenerates to plain
+     LASSO. Read the ALASSO vs LASSO columns at those n: if they collapse
+     (ALASSO - LASSO ~ 0), treat that row as LASSO, not as a sparsity result.
 """
 import argparse
 import io
@@ -75,26 +82,24 @@ FIT_KW = dict(nalpha=20, cv=5, tol=1e-6, max_iter=20000, alpha_auto=True,
 # [FIX] the RIDGE control must actually regularize. The default grid
 # [1e-6, 1e-2] on standardized columns is ~unregularized (RIDGE collapses to
 # OLS), which would make the "regularization vs sparsity" comparison useless.
-# Lasso/ALASSO alpha is n-invariant (1/(2n) objective + KKT anchor max|X^T y|/n),
-# but Ridge's objective has NO 1/n, so a fixed alpha shrinks relatively MORE as n
-# shrinks (n=6 ~7x stronger than n=45). The grid is therefore scaled by
-# train-rows / 20412 (the n=45 train fold: 36 configs x 567 rows) so alpha means
-# the same thing at every n. 50 points over 10 decades keeps the step at ~1.6x
-# (the same density P38 restored for ALASSO), not 2.2x.
+# 50 points over 10 decades keeps the step at ~1.6x (the same density P38
+# restored for ALASSO), not 2.2x.
+#
+# The grid is deliberately NOT scaled by n: standardize=True rescales every
+# column to unit L2 norm, so X^T X has unit diagonal, trace = p and a spectrum
+# independent of n -- alpha is already n-comparable. Scaling only RIDGE would
+# BREAK that comparability, because ALASSO's own ridge pilot runs the SAME
+# _ridge_solve(A_fit, y, init_alpha=1e-3) on the SAME standardized columns with
+# an UNSCALED alpha. Either both scale or neither; neither is correct.
 RIDGE_BASE = np.logspace(-6, 4, 50)          # 1e-6 .. 1e4, 50 pts
-RIDGE_REF_ROWS = 20412.0                     # n=45 train fold rows (36 * 567)
 
 
 def _method_fit(method, A, y):
     from pheasy.core.optimizer import Optimizer
     std = method in ("LASSO", "ALASSO", "RIDGE")
     kw = dict(FIT_KW, rand_seed=0, standardize=std)
-    rgrid = None
     if method == "RIDGE":
-        # scale the base grid by this fold's train-row count so alpha means the
-        # same shrinkage as the n=45 reference at every n in the sweep.
-        rgrid = RIDGE_BASE * (A.shape[0] / RIDGE_REF_ROWS)
-        kw["alpha"] = rgrid
+        kw["alpha"] = RIDGE_BASE
         kw["alpha_auto"] = False
     o = Optimizer(method, **kw)
     import contextlib
@@ -104,13 +109,30 @@ def _method_fit(method, A, y):
     flag = ""
     if "grid MINIMUM" in buf.getvalue():
         flag += "A@MIN"
+    if method in ("LASSO", "ALASSO"):
+        # [FIX] decade flag: ALASSO's weighted grid switches regime with n
+        # (overdetermined -> max(decades,6)=6 decades; underdetermined -> 4), so
+        # report the effective span to make the switch visible per row.
+        _al = getattr(o._model, "alphas_", None)
+        if _al is not None and np.size(_al) > 1:
+            _al = np.asarray(_al)
+            flag += ("+" if flag else "") + "D%.1f" % float(
+                np.log10(_al.max() / _al.min()))
+    if method == "ALASSO":
+        # [FIX] weight dispersion: at n<=9 the ridge pilot is a near-min-norm
+        # solution whose magnitudes flatten -> weights go uniform -> ALASSO
+        # degenerates to plain LASSO. std(log w) quantifies the adaptivity loss.
+        _w = getattr(o._model, "_weights", None)
+        if _w is not None:
+            flag += ("+" if flag else "") + "W%.2f" % float(
+                np.std(np.log(np.maximum(np.asarray(_w), 1e-300))))
     if method == "RIDGE":
         # same edge detection we spent many rounds giving ALASSO: the control is
         # useless if CV picked a grid edge (wants outside the grid).
         a = float(o._model.alpha_)
-        if a <= rgrid[0] * (1.0 + 1e-9):
+        if a <= RIDGE_BASE[0] * (1.0 + 1e-9):
             flag += ("+" if flag else "") + "R@lo"
-        elif a >= rgrid[-1] * (1.0 - 1e-9):
+        elif a >= RIDGE_BASE[-1] * (1.0 - 1e-9):
             flag += ("+" if flag else "") + "R@hi"
     # use the formal exit (o.results["coef"]) rather than o._model.coef_; the
     # latter is fragile (depends on a write-back that could be removed).
@@ -187,7 +209,7 @@ def main():
             res[m]["rmse"].append(rmse)
             res[m]["rel_l2"].append(rel)
             res[m]["flag"].append(flag)
-            print("    %-8s rmse=%.4e  relL2=%.4e  nnz=%d  %-12s  (%.1fs)"
+            print("    %-8s rmse=%.4e  relL2=%.4e  nnz=%d  %-20s  (%.1fs)"
                   % (m, rmse, rel, int(np.count_nonzero(coef)), flag, time.time() - t0),
                   flush=True)
 
