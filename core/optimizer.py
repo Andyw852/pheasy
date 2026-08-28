@@ -801,7 +801,7 @@ class TwoLevelSM(LinearOperator):
 
 
 
-def _reselect_alpha(model, A, y, sample_weight=None, grid_gap_decades=0.0):
+def _reselect_alpha(model, A, y, sample_weight=None, grid_diag=None):
     """[FIX P10] Re-pick alpha from the CV path and refit if it changed.
 
     Two problems with sklearn's plain ``argmin`` here:
@@ -834,22 +834,28 @@ def _reselect_alpha(model, A, y, sample_weight=None, grid_gap_decades=0.0):
     # [FIX P43] a flat CV tail is only a CONVERGENCE problem if coordinate
     # descent actually hit its iteration cap; otherwise it converged and the tail
     # is genuinely flat (the alphas simply do not separate).
+    # [FIX P43/P44] sklearn's LassoCV.n_iter_ is the FINAL refit's iteration
+    # count at the chosen alpha*, NOT the CV-path fits that produced the tail --
+    # so it cannot certify that the tail is genuine. Only a hit cap
+    # (n_iter >= max_iter) is assertable; otherwise we state the path is not
+    # ruled out and ask for a tighter --tol to confirm (the flat tail often
+    # disappears once tol is tightened).
     _n_iter = int(np.max(np.atleast_1d(model.n_iter_)))
     _hit_cap = _n_iter >= int(model.max_iter)
     if tied.size > 1:
         if _hit_cap:
-            print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). The "
-                  "coordinate descent almost certainly stopped on max_iter/tol "
-                  "rather than converging -- lower --tol (1e-6) and/or raise "
-                  "--max_iter, otherwise the fit is over-regularized."
-                  % (tied.size, best, float(alphas[tied].min()),
-                     float(alphas[tied].max())), flush=True)
-        else:
-            print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e); "
-                  "coordinate descent already converged (n_iter=%d), so the CV "
-                  "tail is genuinely flat."
+            print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). "
+                  "Coordinate descent hit max_iter (%d); lower --tol (1e-6) "
+                  "and/or raise --max_iter, otherwise the fit is over-regularized."
                   % (tied.size, best, float(alphas[tied].min()),
                      float(alphas[tied].max()), _n_iter), flush=True)
+        else:
+            print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). "
+                  "The final refit converged in %d iters, but sklearn does not "
+                  "expose the CV-path iteration counts, so a tolerance-limited "
+                  "path is not ruled out -- re-run with a tighter --tol to "
+                  "confirm." % (tied.size, best, float(alphas[tied].min()),
+                                float(alphas[tied].max()), _n_iter), flush=True)
     # [FIX P39/P41/P42/P43] alpha* pinned to the grid MINIMUM has FOUR causes, in
     # priority order: (1) the whole grid is below the weighted KKT threshold -- a
     # GRID-scale problem (manual --no-alpha_auto); (2) a flat tail AND CD hit
@@ -863,12 +869,9 @@ def _reselect_alpha(model, A, y, sample_weight=None, grid_gap_decades=0.0):
         and float(alphas[tied].min()) <= float(alphas.min()) * (1.0 + 1e-12))
     model._alpha_at_min_hitcap = model._alpha_at_min_flat and _hit_cap
     if model._alpha_at_min:
-        if grid_gap_decades > 1.0:
-            print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM because the "
-                  "ENTIRE grid lies %.1f decades below the weighted KKT threshold: "
-                  "the GRID, not the data, pins alpha*. Drop --no-alpha_auto and "
-                  "use the weighted auto grid."
-                  % (new_alpha, grid_gap_decades), flush=True)
+        if grid_diag:
+            print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; %s"
+                  % (new_alpha, grid_diag), flush=True)
         elif model._alpha_at_min_hitcap:
             print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM via the "
                   "tie-break on a FLAT CV tail AND CD hit max_iter; this is a "
@@ -877,8 +880,9 @@ def _reselect_alpha(model, A, y, sample_weight=None, grid_gap_decades=0.0):
                   flush=True)
         elif model._alpha_at_min_flat:
             print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM on a flat CV "
-                  "tail, but CD already converged (n_iter=%d): alpha* is not "
-                  "well-determined by CV (not a convergence problem)."
+                  "tail; the final refit converged in %d iters, but sklearn does "
+                  "not expose the CV-path iteration counts, so a tolerance-limited "
+                  "path is not ruled out -- re-run with a tighter --tol to confirm."
                   % (new_alpha, _n_iter), flush=True)
         else:
             print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV curve "
@@ -956,7 +960,7 @@ class _LassoCVIterative:
     """
     def __init__(self, alphas, cv, tol, max_iter, rand_seed, n_jobs=1,
                  fit_intercept=False, group_size=None, selection="cyclic",
-                 penalty_weights=None, grid_gap_decades=0.0):
+                 penalty_weights=None, grid_diag=None):
         # [FIX P40] sort ascending: the alpha walk assumes smallest-first and
         # the grid-MINIMUM edge check (best_i == 0) depends on it. Callers pass
         # logspace/derive grids that are ascending, but be explicit rather than
@@ -971,10 +975,10 @@ class _LassoCVIterative:
         self.group_size = group_size
         self.selection = selection
         self.penalty_weights = penalty_weights
-        # [FIX P43] manual-grid scale mismatch (decades below the weighted KKT
-        # threshold); used to give the GRID, not the data, as the cause of a
-        # pinned alpha*.
-        self.grid_gap_decades = float(grid_gap_decades)
+        # [FIX P44] manual-grid scale-mismatch diagnosis (message string from
+        # _AdaptiveLassoCV.fit); used to give the GRID, not the data, as the
+        # cause of a pinned alpha*.
+        self.grid_diag = grid_diag
         self._lipschitz = None
 
     def fit(self, A, y, sample_weight=None):
@@ -1137,11 +1141,11 @@ class _LassoCVIterative:
             if _cv_hit_cap:
                 print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). "
                       "The CV solver (FISTA, tol=%.0e) hit cv_max_iter (%d) and is "
-                      "too loose to separate them -- lower PHEASY_CV_TOL (now %.0e) "
-                      "or raise PHEASY_CV_MAX_ITER (now %d)."
+                      "too loose to separate them -- lower PHEASY_CV_TOL / raise "
+                      "PHEASY_CV_MAX_ITER."
                       % (tied.size, best_mean, float(self.alphas[tied].min()),
-                         float(self.alphas[tied].max()), cv_tol, cv_max_iter,
-                         cv_tol, cv_max_iter), flush=True)
+                         float(self.alphas[tied].max()), cv_tol, cv_max_iter),
+                      flush=True)
             else:
                 print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e); "
                       "FISTA already converged (max %d iters < %d), so the CV tail "
@@ -1149,24 +1153,24 @@ class _LassoCVIterative:
                       % (tied.size, best_mean, float(self.alphas[tied].min()),
                          float(self.alphas[tied].max()), _cv_max_n_iter,
                          cv_max_iter), flush=True)
-        # [FIX P39/P41/P42/P43] best_i == 0 is the SMALLEST alpha (the grid walks
-        # descending). Four causes, in priority order: (1) whole grid below the
-        # weighted KKT threshold -- a GRID-scale problem (manual --no-alpha_auto);
-        # (2) flat tail AND FISTA hit cv_max_iter -- CONVERGENCE; (3) flat tail but
-        # FISTA converged -- alpha* not well-determined; (4) the curve still falls --
-        # model-density (treat as unregularized / compare OLS).
+        # [FIX P39/P41/P42/P43/P44] best_i == 0 is the SMALLEST alpha (the grid
+        # walks descending). Four causes, in priority order: (1) manual-grid scale
+        # mismatch -- a GRID-scale problem; (2) flat tail AND FISTA hit cv_max_iter
+        # -- CONVERGENCE; (3) flat tail but FISTA converged -- alpha* not
+        # well-determined; (4) the curve still falls -- model-density (treat as
+        # unregularized / compare OLS). NOTE: unlike the sklearn path (whose n_iter_
+        # is the final refit count and cannot certify convergence), _cv_max_n_iter
+        # HERE measures the actual CV-path FISTA iterations, so the 'FISTA already
+        # converged' branch is a real assertion.
         self._alpha_at_min = (best_i == 0)
         self._alpha_at_min_flat = (
             self._alpha_at_min and tied.size > 1
             and float(self.alphas[tied].min()) <= float(self.alphas.min()) * (1.0 + 1e-12))
         self._alpha_at_min_hitcap = self._alpha_at_min_flat and _cv_hit_cap
         if self._alpha_at_min:
-            if self.grid_gap_decades > 1.0:
-                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM because "
-                      "the ENTIRE grid lies %.1f decades below the weighted KKT "
-                      "threshold: the GRID, not the data, pins alpha*. Drop "
-                      "--no-alpha_auto and use the weighted auto grid."
-                      % (float(self.alphas[0]), self.grid_gap_decades), flush=True)
+            if self.grid_diag:
+                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; %s"
+                      % (float(self.alphas[0]), self.grid_diag), flush=True)
             elif self._alpha_at_min_hitcap:
                 print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM via the "
                       "tie-break on a FLAT CV tail AND FISTA hit cv_max_iter; this "
@@ -1242,6 +1246,7 @@ class _LassoCVModel:
             self.n_features_in_ = it.n_features_in_
             self._alpha_at_min = getattr(it, "_alpha_at_min", False)
             self._alpha_at_min_flat = getattr(it, "_alpha_at_min_flat", False)
+            self._alpha_at_min_hitcap = getattr(it, "_alpha_at_min_hitcap", False)
             return self
 
         n_samples = A.shape[0]
@@ -1268,6 +1273,7 @@ class _LassoCVModel:
         self.n_features_in_ = A.shape[1]
         self._alpha_at_min = getattr(model, "_alpha_at_min", False)
         self._alpha_at_min_flat = getattr(model, "_alpha_at_min_flat", False)
+        self._alpha_at_min_hitcap = getattr(model, "_alpha_at_min_hitcap", False)
         return self
 
     def predict(self, A):
@@ -1328,7 +1334,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
         _manual = bool(self.nalpha and not self.alpha_auto)
         _mu_shift = bool(self.nalpha and self.alpha_auto and not _wgrid)
         _a_uw = _a_max = 0.0
-        _gap = 0.0   # [FIX P43] decades the manual grid bottom is below a_max_w
+        _grid_diag = None   # [FIX P44] manual-grid scale-mismatch diagnosis string
         if _override:
             # [FIX P39/P40] one rmatvec for BOTH the weighted KKT threshold and the
             # unweighted one, kept in A's dtype so a float32 sensing matrix is not
@@ -1410,12 +1416,27 @@ class _AdaptiveLassoCV(_LassoCVModel):
             # nnz 375 vs the weighted grid's re 0.0063, nnz 1223).
             _lo_m = float(self.alphas.min())
             _hi_m = float(self.alphas.max())
-            _gap = np.log10(_a_max / _lo_m)
-            print("[ALASSO] manual alpha grid [%.3e .. %.3e] used AS-IS; the "
-                  "penalty lives in weighted (A/w) space and its KKT threshold "
-                  "is %.3e, %.1f decades ABOVE the grid bottom -- an unweighted-"
-                  "scale grid over-regularizes ALASSO (alpha* will pin low)."
-                  % (_lo_m, _hi_m, _a_max, _gap), flush=True)
+            _a_uw = float(_g_raw.max()) / n_samples
+            _auto_lo = min(_a_max, _a_uw) * 10.0 ** -max(self.decades, 6.0)
+            if _hi_m < _a_max:
+                _grid_diag = ("the ENTIRE grid lies below the weighted KKT "
+                              "threshold (%.3e): no grid point regularizes at "
+                              "all -- the GRID, not the data, pins alpha*. Drop "
+                              "--no-alpha_auto and use the weighted auto grid."
+                              % _a_max)
+            elif _lo_m > _auto_lo * 10.0:
+                _grid_diag = ("the grid BOTTOM (%.3e) is %.1f decades ABOVE "
+                              "where the auto grid starts (%.3e): it never "
+                              "reaches the under-regularized regime, so alpha* "
+                              "pins low and the fit is OVER-regularized. Drop "
+                              "--no-alpha_auto and use the weighted auto grid."
+                              % (_lo_m, np.log10(_lo_m / _auto_lo), _auto_lo))
+            else:
+                _grid_diag = None
+            self._grid_diag = _grid_diag
+            if _grid_diag is not None:
+                print("[ALASSO] manual alpha grid [%.3e .. %.3e] used AS-IS; %s"
+                      % (_lo_m, _hi_m, _grid_diag), flush=True)
         elif _mu_shift and self.alphas.size > 1:
             # [FIX P40] mu_shift-auto grid (PHEASY_ALASSO_WEIGHTED_GRID=0 with
             # alpha_auto): run_pheasy already did the rmatvec to derive it, so no
@@ -1434,7 +1455,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
                 self.n_jobs, fit_intercept=self.fit_intercept,
                 group_size=self.group_size, selection=self.selection,
-                penalty_weights=self._weights, grid_gap_decades=_gap)
+                penalty_weights=self._weights, grid_diag=_grid_diag)
             it.fit(A, y, sample_weight=sample_weight)
             self.model_ = it
             self.coef_ = it.coef_
@@ -1446,6 +1467,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
             self.n_features_in_ = A.shape[1]
             self._alpha_at_min = getattr(it, "_alpha_at_min", False)
             self._alpha_at_min_flat = getattr(it, "_alpha_at_min_flat", False)
+            self._alpha_at_min_hitcap = getattr(it, "_alpha_at_min_hitcap", False)
             return self
 
         A_scaled = _scale_columns(A, self._weights)
@@ -1462,7 +1484,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
         )
         model.fit(A_scaled, y, sample_weight=sample_weight)
         _reselect_alpha(model, A_scaled, y, sample_weight=sample_weight,
-                       grid_gap_decades=_gap)  # [FIX P23/P43]
+                       grid_diag=_grid_diag)  # [FIX P23/P43/P44]
         self.model_ = model
         self.coef_ = model.coef_ / self._weights
         self.intercept_ = model.intercept_ if self.fit_intercept else 0.0
@@ -1473,6 +1495,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
         self.n_features_in_ = A.shape[1]
         self._alpha_at_min = getattr(model, "_alpha_at_min", False)
         self._alpha_at_min_flat = getattr(model, "_alpha_at_min_flat", False)
+        self._alpha_at_min_hitcap = getattr(model, "_alpha_at_min_hitcap", False)
         return self
 
     def predict(self, A):
