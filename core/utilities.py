@@ -481,7 +481,9 @@ def assert_uniform_dtype(**arrays):
             n = int(data.size)
             if n >= 32:  # 样本太少时往返无损无诊断意义
                 step = max(1, n // 200_000)
-                d = data[::step]
+                # reshape(-1): 二维 dense 的 data[::step] 切的是行不是元素,
+                # 极扁矩阵(如 2 x 1e7)会失效; 展平后按元素抽. C-contiguous 是 view.
+                d = data.reshape(-1)[::step]
                 if _np_smd.array_equal(
                         d.astype(_np_smd.float32).astype(_np_smd.float64), d):
                     fake64.append(name)
