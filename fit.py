@@ -101,7 +101,7 @@ def fit_method(method, A, y):
             flag += ("+" if flag else "") + "R@hi"
     coef = np.asarray(o.results["coef"], dtype=np.float64)
     alpha = o.results.get("alpha")
-    return coef, flag, alpha, o._model
+    return coef, flag, alpha
 
 
 def cv_report(method, A, y, rows_per_config, seed, alpha):
@@ -113,6 +113,11 @@ def cv_report(method, A, y, rows_per_config, seed, alpha):
     include the cost of alpha selection (unlike holdout_eval.py, which re-selects
     alpha inside each training fold). The two are therefore NOT comparable; do
     not cite one as the other.
+
+    Caveat: this "fixed alpha" applies only to LASSO/ALASSO/RIDGE. RFE has no
+    scalar to pin (its results["alpha"] is the ridge pilot, not the feature
+    count), so RFE re-selects its support per fold and its number DOES include
+    the selection cost -- it is not strictly comparable to the other three.
     """
     from pheasy.core.optimizer import Optimizer
     std = method in ("LASSO", "ALASSO", "RIDGE")
@@ -179,13 +184,14 @@ def main():
     # (the same leak fixed in holdout_eval.py).  Mirror that file: setdefault so
     # a caller's explicit override wins, then ASSERT we honour --rows-per-config.
     os.environ.setdefault("PHEASY_CV_GROUP_SIZE", str(args.rows_per_config))
-    _gs = int(os.environ["PHEASY_CV_GROUP_SIZE"])
+    _raw = os.environ["PHEASY_CV_GROUP_SIZE"]
+    _gs = int(_raw or "0")
     if _gs != args.rows_per_config:
-        raise SystemExit("PHEASY_CV_GROUP_SIZE=%d overrides --rows-per-config=%d"
-                         % (_gs, args.rows_per_config))
+        raise SystemExit("PHEASY_CV_GROUP_SIZE=%r overrides --rows-per-config=%d"
+                         % (_raw, args.rows_per_config))
     print("inner CV grouped by config (group_size=%d)" % _gs, flush=True)
 
-    coef, flag, alpha, fit_model = fit_method(method, SM, F)
+    coef, flag, alpha = fit_method(method, SM, F)
 
     pred = SM @ coef
     err = pred - F

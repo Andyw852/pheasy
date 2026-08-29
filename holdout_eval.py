@@ -193,11 +193,12 @@ def main():
     # different value (it would not override) or if n_samples % gs != 0 (the
     # detector then returns None and the inner CV silently falls back to
     # row-random). Assert + announce so a grouped-CV failure cannot be silent.
-    _gs = int(os.environ["PHEASY_CV_GROUP_SIZE"])
+    _raw = os.environ["PHEASY_CV_GROUP_SIZE"]
+    _gs = int(_raw or "0")
     if _gs != args.rows_per_config:
         raise SystemExit(
-            "PHEASY_CV_GROUP_SIZE=%d overrides --rows-per-config=%d"
-            % (_gs, args.rows_per_config))
+            "PHEASY_CV_GROUP_SIZE=%r overrides --rows-per-config=%d"
+            % (_raw, args.rows_per_config))
     print("inner CV grouped by config (group_size=%d)" % _gs, flush=True)
     SM, F = _load_sm_f(args.data_dir, args.n_configs, args.rows_per_config,
                        args.sm_dtype)
