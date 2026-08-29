@@ -104,23 +104,18 @@ def fit_method(method, A, y):
     return coef, flag, alpha, o._model
 
 
-def cv_report(method, A, y, rows_per_config, seed, alpha, model):
-    """Grouped K-fold CV: per-fold RMSE of the final fitted model.
+def cv_report(method, A, y, rows_per_config, seed, alpha):
+    """Grouped K-fold CV: per-fold RMSE of the DELIVERED model, at a FIXED alpha.
 
-    LASSO/ALASSO reuse the alpha-selection CV path already stored on the model
-    (mse_path_, n_alphas x n_folds) at the selected alpha -- no re-fit.  The
-    others do a manual grouped refit per fold at the fixed settings.
+    Every method walks the same grouped (by-config) K-fold split and refits on
+    the training folds with the alpha FIXED to the full-data-selected value.
+    So the reported number is the CV error AT THE GIVEN alpha, and does NOT
+    include the cost of alpha selection (unlike holdout_eval.py, which re-selects
+    alpha inside each training fold). The two are therefore NOT comparable; do
+    not cite one as the other.
     """
     from pheasy.core.optimizer import Optimizer
     std = method in ("LASSO", "ALASSO", "RIDGE")
-    mse_path = getattr(model, "mse_path_", None)
-    if (mse_path is not None and np.ndim(mse_path) == 2
-            and mse_path.shape[1] > 1 and method in ("LASSO", "ALASSO")):
-        alphas = np.asarray(getattr(model, "alphas_", model.alphas))
-        a = float(getattr(model, "alpha_", alphas[0]))
-        idx = int(np.argmin(np.abs(alphas - a)))
-        return [float(np.sqrt(v)) for v in mse_path[idx]]
-
     group_size = rows_per_config
     n = A.shape[0]
     n_conf = n // group_size
@@ -156,7 +151,9 @@ def main():
     ap.add_argument("--rows-per-config", type=int, default=567,
                     help="每构型行数 = 3 x 超胞原子数 (默认 567)")
     ap.add_argument("--sm-dtype", default=os.environ.get("PHEASY_SM_DTYPE", "float64"),
-                    choices=["float32", "float64"])
+                    choices=["float32", "float64"],
+                    help=("sensing-matrix 精度; 注意 sm_prime.npz 存储时的 dtype 才决定 "
+                          "真实精度, 这里只是加载后的上转型 (P44). 生产扫描默认 float32."))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cv-report", action="store_true",
                     help="额外输出每组 CV 折的 RMSE (分组, 按构型)")
@@ -176,6 +173,18 @@ def main():
     print("loaded SM %s F %s (dtype=%s, rows_per_config=%d)"
           % (SM.shape, F.shape, SM.dtype, args.rows_per_config), flush=True)
 
+    # [FIX] grouped CV by configuration.  Without this, the LASSO/ALASSO inner
+    # alpha-selection CV falls back to plain row-random KFold, which leaks rows
+    # of the same configuration across train/val and underestimates the error
+    # (the same leak fixed in holdout_eval.py).  Mirror that file: setdefault so
+    # a caller's explicit override wins, then ASSERT we honour --rows-per-config.
+    os.environ.setdefault("PHEASY_CV_GROUP_SIZE", str(args.rows_per_config))
+    _gs = int(os.environ["PHEASY_CV_GROUP_SIZE"])
+    if _gs != args.rows_per_config:
+        raise SystemExit("PHEASY_CV_GROUP_SIZE=%d overrides --rows-per-config=%d"
+                         % (_gs, args.rows_per_config))
+    print("inner CV grouped by config (group_size=%d)" % _gs, flush=True)
+
     coef, flag, alpha, fit_model = fit_method(method, SM, F)
 
     pred = SM @ coef
@@ -193,8 +202,7 @@ def main():
     print("flag       = %s" % (flag or "-"))
 
     if args.cv_report:
-        folds = cv_report(method, SM, F, args.rows_per_config, args.seed, alpha,
-                          fit_model)
+        folds = cv_report(method, SM, F, args.rows_per_config, args.seed, alpha)
         print("cv_folds   = [" + ", ".join("%.4e" % r for r in folds) + "]")
         print("cv_mean    = %.4e" % float(np.mean(folds)))
         print("cv_std     = %.4e" % float(np.std(folds)))

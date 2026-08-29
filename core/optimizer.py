@@ -1576,7 +1576,7 @@ class _RFECVBase:
         self._criterion = "cv"
 
     def _cv_group_size(self, n_samples):
-        gs = int(os.environ.get("PHEASY_CV_GROUP_SIZE", "0"))
+        gs = int(os.environ.get("PHEASY_CV_GROUP_SIZE", "0") or "0")
         if gs > 1 and n_samples % gs == 0:
             return gs
         return None
@@ -2090,7 +2090,7 @@ class Optimizer(object):
 
     @staticmethod
     def _detect_group_size(n_samples):
-        gs = int(os.environ.get("PHEASY_CV_GROUP_SIZE", "0"))
+        gs = int(os.environ.get("PHEASY_CV_GROUP_SIZE", "0") or "0")
         if gs > 1 and n_samples % gs == 0:
             return gs
         return None
