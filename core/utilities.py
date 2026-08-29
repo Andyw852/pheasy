@@ -457,14 +457,32 @@ def assert_uniform_dtype(**arrays):
     用法::
 
         assert_uniform_dtype(X=X, y=y_in)
+
+    [FIX] 除容器 dtype 外再验"值级": 若某 float64 容器的值经 float32
+    往返无损 (astype(float32).astype(float64) == 原值), 说明值其实是
+    float32 算出来的、只是被无损上转成了 float64 容器 —— 这正是
+    "硬编码 astype(np.float32) 后又 .astype(_sm_dtype()) 上转" 的特征,
+    只比容器 dtype 会被它完美掩盖。此时抛错, 指向遗漏的硬编码。
     """
     seen = {}
+    fake64 = []
     for name, obj in arrays.items():
         dt = getattr(obj, "dtype", None)
-        if dt is not None:
-            seen[name] = _np_smd.dtype(dt).name
+        if dt is None:
+            continue
+        seen[name] = _np_smd.dtype(dt).name
+        if _np_smd.dtype(dt).name == "float64":
+            data = obj.data if issparse(obj) else _np_smd.asarray(obj)
+            if data.size and _np_smd.array_equal(
+                    data.astype(_np_smd.float32).astype(_np_smd.float64), data):
+                fake64.append(name)
     if len(set(seen.values())) > 1:
         raise RuntimeError(
             "线性系统 dtype 不一致: %s —— 可能有遗漏的 astype(np.float32) 硬编码" % seen
+        )
+    if fake64:
+        raise RuntimeError(
+            "float64 容器但值级为 float32 (经 float32 往返无损): %s —— "
+            "存在遗漏的 astype(np.float32) 硬编码, 后被无损上转成 float64 掩盖" % fake64
         )
     return seen

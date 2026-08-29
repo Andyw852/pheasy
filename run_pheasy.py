@@ -18,7 +18,7 @@ from pheasy.structure.symmetry import get_spacegroup, get_symmetry
 from pheasy.structure.force_constants import ForceConstants
 from pheasy.core.cluster_orbit import CSGenerator, ClusterSpace
 from pheasy.core.symmetry_constraints import SymmetryConstraints
-from pheasy.core.utilities import get_exclude_set
+from pheasy.core.utilities import get_exclude_set, assert_uniform_dtype
 from pheasy.core.optimizer import Optimizer
 from pheasy.core.displacements import (
     move_atoms_simple,
@@ -30,19 +30,30 @@ from joblib import Parallel, delayed
 
 # ===================================================================
 # [PATCH] sparse-in-worker wrapper
-# 让并行 worker 直接返回 CSR f32, 避免主进程累积大量 dense f64 (~619 GB).
+# 让并行 worker 直接返回 CSR (默认 float32), 避免主进程累积大量 dense f64.
 # 拟合结果完全等价于原始路径; 下游代码无需修改.
+# [FIX] 精度由 get_sm_dtype() 决定, 不再硬编码 float32.
 # ===================================================================
 def _build_sensing_matrix_sparse(CS_full, u):
-    """Worker-side: build dense sensing block then immediately convert
-    to CSR float32 inside the worker, so the dense f64 block (1.3 GB)
-    is freed before pickling back to the main process."""
+    """Worker-side: build dense sensing block then immediately convert to CSR
+    inside the worker, so the dense f64 block (~1.3 GB) is freed before
+    pickling back to the main process.
+
+    [FIX P14-regression] the cast used to HARDCODE float32, so
+    PHEASY_SM_DTYPE=float64 was silently ignored whenever PHEASY_N_JOBS>1
+    (the parallel path): SM_prime stayed float32 and the later
+    .astype(_sm_dtype()) upcast it losslessly into a float64 *container*,
+    hiding the bug. Now it honours get_sm_dtype(); float32 is still the
+    default so the memory win is unchanged, and a float64 run pays the
+    pickle cost it asked for."""
     import numpy as _np
     import scipy.sparse as _sp
+    from pheasy.core.utilities import get_sm_dtype as _get_sm_dtype
+    _dt = _get_sm_dtype()
     _mat = build_sensing_matrix(CS_full, u)
     if _sp.issparse(_mat):
-        return _mat.tocsr().astype(_np.float32, copy=False)
-    return _sp.csr_matrix(_mat.astype(_np.float32, copy=False))
+        return _mat.tocsr().astype(_dt, copy=False)
+    return _sp.csr_matrix(_mat.astype(_dt, copy=False))
 
 from pheasy.core.forces import read_interatomic_forces, read_interatomic_forces_aimd
 try:  # [PATCH sm-dtype]
@@ -1114,6 +1125,12 @@ class WorkFlow(object):
                             except Exception as _e:
                                 print(f'[SM-cache] save fail: {_e}', flush=True)
                 FM = FM.astype(_sm_dtype())
+
+            # [FIX] 值级 dtype 一致性: 容器 dtype 相同还不够, 若 float64 容器的值
+            # 经 float32 往返无损, 说明是遗漏的硬编码 astype(np.float32) 被上转掩盖.
+            # 跳过 TwoLevelSM (LinearOperator, 无具体矩阵).
+            if hasattr(SM, 'dtype') and (_sp_p.issparse(SM) or isinstance(SM, _np_p.ndarray)):
+                assert_uniform_dtype(SM=SM, FM=FM)
 
             # Train interatomic force constants
             # PATCH: optionally redirect LASSO -> ALASSO via env var
