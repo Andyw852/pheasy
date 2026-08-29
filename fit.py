@@ -101,7 +101,49 @@ def fit_method(method, A, y):
             flag += ("+" if flag else "") + "R@hi"
     coef = np.asarray(o.results["coef"], dtype=np.float64)
     alpha = o.results.get("alpha")
-    return coef, flag, alpha
+    return coef, flag, alpha, o._model
+
+
+def cv_report(method, A, y, rows_per_config, seed, alpha, model):
+    """Grouped K-fold CV: per-fold RMSE of the final fitted model.
+
+    LASSO/ALASSO reuse the alpha-selection CV path already stored on the model
+    (mse_path_, n_alphas x n_folds) at the selected alpha -- no re-fit.  The
+    others do a manual grouped refit per fold at the fixed settings.
+    """
+    from pheasy.core.optimizer import Optimizer
+    std = method in ("LASSO", "ALASSO", "RIDGE")
+    mse_path = getattr(model, "mse_path_", None)
+    if (mse_path is not None and np.ndim(mse_path) == 2
+            and mse_path.shape[1] > 1 and method in ("LASSO", "ALASSO")):
+        alphas = np.asarray(getattr(model, "alphas_", model.alphas))
+        a = float(getattr(model, "alpha_", alphas[0]))
+        idx = int(np.argmin(np.abs(alphas - a)))
+        return [float(np.sqrt(v)) for v in mse_path[idx]]
+
+    group_size = rows_per_config
+    n = A.shape[0]
+    n_conf = n // group_size
+    k = min(FIT_KW["cv"], n_conf)
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(n_conf)
+    folds = [f for f in np.array_split(order, k) if len(f) > 0]
+    rmses = []
+    for held in folds:
+        val = np.zeros(n, dtype=bool)
+        for c in held:
+            val[c * group_size:(c + 1) * group_size] = True
+        tr = ~val
+        kw = dict(FIT_KW, rand_seed=seed, standardize=std)
+        if method in ("LASSO", "ALASSO", "RIDGE"):
+            kw["alpha"] = [alpha]
+            kw["alpha_auto"] = False
+        o = Optimizer(method, **kw)
+        with contextlib.redirect_stdout(io.StringIO()):
+            o.fit(A[tr], y[tr])
+        pred = A[val] @ o.results["coef"]
+        rmses.append(float(np.sqrt(np.mean((pred - y[val]) ** 2))))
+    return rmses
 
 
 def main():
@@ -116,6 +158,8 @@ def main():
     ap.add_argument("--sm-dtype", default=os.environ.get("PHEASY_SM_DTYPE", "float64"),
                     choices=["float32", "float64"])
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--cv-report", action="store_true",
+                    help="额外输出每组 CV 折的 RMSE (分组, 按构型)")
     ap.add_argument("--write-coef", default=None,
                     help="可选: 把拟合系数存为 .npz (e.g. c.npz)")
     args = ap.parse_args()
@@ -132,7 +176,7 @@ def main():
     print("loaded SM %s F %s (dtype=%s, rows_per_config=%d)"
           % (SM.shape, F.shape, SM.dtype, args.rows_per_config), flush=True)
 
-    coef, flag, alpha = fit_method(method, SM, F)
+    coef, flag, alpha, fit_model = fit_method(method, SM, F)
 
     pred = SM @ coef
     err = pred - F
@@ -147,6 +191,13 @@ def main():
     print("rmse       = %.4e" % rmse)
     print("relL2      = %.4e" % rel)
     print("flag       = %s" % (flag or "-"))
+
+    if args.cv_report:
+        folds = cv_report(method, SM, F, args.rows_per_config, args.seed, alpha,
+                          fit_model)
+        print("cv_folds   = [" + ", ".join("%.4e" % r for r in folds) + "]")
+        print("cv_mean    = %.4e" % float(np.mean(folds)))
+        print("cv_std     = %.4e" % float(np.std(folds)))
 
     if args.write_coef:
         np.savez(args.write_coef, coef=coef, alpha=alpha, nnz=nnz,
