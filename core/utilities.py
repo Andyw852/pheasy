@@ -462,8 +462,13 @@ def assert_uniform_dtype(**arrays):
     往返无损 (astype(float32).astype(float64) == 原值), 说明值其实是
     float32 算出来的、只是被无损上转成了 float64 容器 —— 这正是
     "硬编码 astype(np.float32) 后又 .astype(_sm_dtype()) 上转" 的特征,
-    只比容器 dtype 会被它完美掩盖。此时抛错, 指向遗漏的硬编码。
+    只比容器 dtype 会被它完美掩盖。
+
+    值级检查用抽样 (≤20 万样本) 控制峰值内存; 且是**诊断而非正确性守卫**:
+    默认 warnings.warn (对有理数矩阵如 NS 的 0/±1/±1/2ⁿ 会整体往返无损、
+    属误报, 不应因此杀掉长作业); 设 PHEASY_DTYPE_CHECK=raise 才转抛错。
     """
+    import warnings as _w
     seen = {}
     fake64 = []
     for name, obj in arrays.items():
@@ -473,16 +478,24 @@ def assert_uniform_dtype(**arrays):
         seen[name] = _np_smd.dtype(dt).name
         if _np_smd.dtype(dt).name == "float64":
             data = obj.data if issparse(obj) else _np_smd.asarray(obj)
-            if data.size and _np_smd.array_equal(
-                    data.astype(_np_smd.float32).astype(_np_smd.float64), data):
-                fake64.append(name)
+            n = int(data.size)
+            if n >= 32:  # 样本太少时往返无损无诊断意义
+                step = max(1, n // 200_000)
+                d = data[::step]
+                if _np_smd.array_equal(
+                        d.astype(_np_smd.float32).astype(_np_smd.float64), d):
+                    fake64.append(name)
     if len(set(seen.values())) > 1:
+        # 跨 dtype 不一致是真正的正确性问题, 保留 raise
         raise RuntimeError(
             "线性系统 dtype 不一致: %s —— 可能有遗漏的 astype(np.float32) 硬编码" % seen
         )
     if fake64:
-        raise RuntimeError(
+        _msg = (
             "float64 容器但值级为 float32 (经 float32 往返无损): %s —— "
             "存在遗漏的 astype(np.float32) 硬编码, 后被无损上转成 float64 掩盖" % fake64
         )
+        if _os_smd.environ.get("PHEASY_DTYPE_CHECK", "").strip().lower() == "raise":
+            raise RuntimeError(_msg)
+        _w.warn(_msg)
     return seen
