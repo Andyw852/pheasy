@@ -166,7 +166,7 @@ def block_diag_sparse(mats, order, format=None, dtype=None):
 
 
 def get_permutation_matrix(index_orginal, index_permuted):
-    """Compute permutation matrix according to input atom index.
+    r"""Compute permutation matrix according to input atom index.
 
     This function generates matrix representation R of permutation
     symmetry for IFCs, i.e. R \Phi(index) = \Phi(index_permuted)
