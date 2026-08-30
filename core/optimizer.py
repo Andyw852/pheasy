@@ -684,6 +684,7 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
     if _is_linear_operator(A):
         # LSMR on a masked operator: no materialization, memory ~O(n_features).
         op_base = _make_masked_op(A, row_idx, col_idx)
+        op = op_base          # no ridge: solve the masked operator directly
         n = len(col_idx)
         atol = float(os.environ.get("PHEASY_LSQR_ATOL", str(
             lsmr_atol if lsmr_atol is not None else 1e-8)))
