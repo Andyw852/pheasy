@@ -3,7 +3,7 @@
 # Copyright (C) 2021-2023 Changpeng Lin
 # All rights reserved.
 
-__all__ = ["write_fc2", "write_fc3", "write_fc4"]
+__all__ = ["write_ifc2", "write_ifc3", "write_ifc4"]
 
 import itertools
 from io import StringIO

@@ -371,7 +371,7 @@ or in crystal coordinate."""
         self._permutations = set(itertools.permutations(self._atom_index, self._order))
 
     def get_all_permutation_matrices(self):
-        """Get all possible matrices for permutating atoms in a cluster.
+        r"""Get all possible matrices for permutating atoms in a cluster.
 
         This method generates matrix representation R of permutation
         symmetry for IFCs, i.e. R \Phi(index) = \Phi(index_permuted).

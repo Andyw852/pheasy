@@ -72,14 +72,13 @@ def _load_sm_f(d, n_configs, rows_per_config, sm_dtype):
     ns_harm = sp.load_npz(os.path.join(d, "ns_harm.npz"))
     ns_anh = sp.load_npz(os.path.join(d, "ns_anharm3.npz"))
     NS = sp.block_diag([ns_harm, ns_anh], format="csr")
-    SM = sm_prime @ NS
     n_rows = n_configs * rows_per_config
     _dt = np.float32 if sm_dtype == "float32" else np.float64
-    SM = np.asarray(SM[:n_rows].toarray(), dtype=_dt)
+    SM = np.asarray((sm_prime[:n_rows] @ NS).toarray(), dtype=_dt)
     if SM.shape[0] != n_rows:
         raise SystemExit("SM has %d rows, expected %d" % (SM.shape[0], n_rows))
     fm = np.load(os.path.join(d, "fm1d.npz"))
-    key = "F" if "F" in fm else list(fm.keys())[0]
+    key = "F" if "F" in fm else next(k for k in fm.files if not k.startswith("_"))
     F = np.asarray(fm[key], dtype=np.float64).ravel()[:n_rows]
     print("loaded SM %s F %s (%.1fs)" % (SM.shape, F.shape, time.time() - t0), flush=True)
     return SM, F

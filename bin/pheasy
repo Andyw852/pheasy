@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Console entry point (also installed as the ``pheasy`` command)."""
+"""Thin launcher for ``python -m`` style runs. The real console
+command comes from [project.scripts] in pyproject.toml; this bin/ file is
+not packaged and is only for direct invocation from a source checkout."""
 import sys
 
 from pheasy.run_pheasy import main

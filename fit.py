@@ -34,7 +34,20 @@ import sys
 import numpy as np
 from scipy import sparse as sp
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+# flat layout maps "pheasy" to the repo root (pyproject package-dir), so a bare
+# source checkout only resolves `import pheasy` when the checkout dir is itself
+# named "pheasy". Expose the root under that name so fit.py runs from any-named
+# checkout without an editable install.
+try:
+    import pheasy  # noqa: F401
+except ImportError:
+    import types as _types
+    _pheasy = _types.ModuleType("pheasy")
+    _pheasy.__path__ = [_ROOT]
+    sys.modules["pheasy"] = _pheasy
 
 FIT_KW = dict(nalpha=20, cv=5, tol=1e-6, max_iter=20000, alpha_auto=True,
               decades=4.0)
@@ -47,15 +60,14 @@ def load_sm_f(d, n_configs, rows_per_config, sm_dtype):
     ns_harm = sp.load_npz(os.path.join(d, "ns_harm.npz"))
     ns_anh = sp.load_npz(os.path.join(d, "ns_anharm3.npz"))
     NS = sp.block_diag([ns_harm, ns_anh], format="csr")
-    SM = sm_prime @ NS
     n_rows = n_configs * rows_per_config
     dt = np.float32 if sm_dtype == "float32" else np.float64
-    SM = np.asarray(SM[:n_rows].toarray(), dtype=dt)
+    SM = np.asarray((sm_prime[:n_rows] @ NS).toarray(), dtype=dt)
     if SM.shape[0] != n_rows:
         raise SystemExit("SM has %d rows, expected %d (check --n-configs/"
                          "--rows-per-config)" % (SM.shape[0], n_rows))
     fm = np.load(os.path.join(d, "fm1d.npz"))
-    key = "F" if "F" in fm else list(fm.keys())[0]
+    key = "F" if "F" in fm else next(k for k in fm.files if not k.startswith("_"))
     F = np.asarray(fm[key], dtype=np.float64).ravel()[:n_rows]
     return SM, F
 
@@ -114,10 +126,13 @@ def cv_report(method, A, y, rows_per_config, seed, alpha):
     alpha inside each training fold). The two are therefore NOT comparable; do
     not cite one as the other.
 
-    Caveat: this "fixed alpha" applies only to LASSO/ALASSO/RIDGE. RFE has no
-    scalar to pin (its results["alpha"] is the ridge pilot, not the feature
-    count), so RFE re-selects its support per fold and its number DOES include
-    the selection cost -- it is not strictly comparable to the other three.
+    Caveat: "fixed alpha" is exact only for LASSO/RIDGE. ALASSO's alpha lives
+    in the weighted space, and its weights are re-derived from each fold's ridge
+    pilot, so the same numeric alpha means a different effective regularization
+    per fold. RFE has no scalar to pin at all (its results["alpha"] is the ridge
+    pilot, not the feature count) and re-selects support per fold. So only
+    LASSO/RIDGE are strictly "at the fixed alpha"; ALASSO and RFE include a
+    selection/weighting cost and are not strictly comparable.
     """
     from pheasy.core.optimizer import Optimizer
     std = method in ("LASSO", "ALASSO", "RIDGE")
@@ -158,7 +173,9 @@ def main():
     ap.add_argument("--sm-dtype", default=os.environ.get("PHEASY_SM_DTYPE", "float64"),
                     choices=["float32", "float64"],
                     help=("sensing-matrix 精度; 注意 sm_prime.npz 存储时的 dtype 才决定 "
-                          "真实精度, 这里只是加载后的上转型 (P44). 生产扫描默认 float32."))
+                          "真实精度, 这里只是加载后的转型: 存储为 float64 时选 float32 是"
+                          "下转型会真丢精度, 选 float64 则只是上转型 (P44). "
+                          "生产扫描默认 float32 (eps 1.2e-7, 与 tol=1e-6 仅差一个量级)."))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cv-report", action="store_true",
                     help="额外输出每组 CV 折的 RMSE (分组, 按构型)")

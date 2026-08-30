@@ -151,7 +151,7 @@ class ForceConstants(object):
                 raise ValueError
             if full:
                 if self._full_ifcs == OrderedDict():
-                    logger.error(f"Full force constant tensor not initialized yet.")
+                    logger.error("Full force constant tensor not initialized yet.")
                     raise AttributeError
                 else:
                     return self._full_ifcs[order]
@@ -160,7 +160,7 @@ class ForceConstants(object):
         else:
             if full:
                 if self._full_ifcs == OrderedDict():
-                    logger.error(f"Full force constant tensor not initialized yet.")
+                    logger.error("Full force constant tensor not initialized yet.")
                     raise AttributeError
                 else:
                     return self._full_ifcs

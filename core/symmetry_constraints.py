@@ -263,8 +263,6 @@ class SymmetryConstraints(object):
                 else:
                     ns_mat = ns_mat.toarray() if _sp.issparse(ns_mat) else ns_mat
                 _n_free = ns_mat.shape[1]
-                _total_rows = sum(_cm.shape[0] for _cm in cons_asr)
-                _stacked_lwork = 2 * _total_rows * _n_free
 
                 def _ns_apply(ns, B, eps):
                     """Apply null-space projection: ns := null(B @ ns) basis.

@@ -37,3 +37,8 @@ pheasy --dim 3 3 3 -w 3 -f --c3 5.2 --ndata 45 -l OLS --full_ifc --hdf5
   curve goes flat and the fit ends up over-regularized. Use `--tol 1e-6`.
 - `PHEASY_SM_DTYPE` (`float64` default) controls the precision of SM / NS / FM.
   All of them must agree, otherwise scipy silently upcasts.
+- The inner CV path runs looser than the final refit regardless of `--tol`:
+  `PHEASY_CV_TOL` defaults to `max(tol, 1e-3)` and `PHEASY_CV_MAX_ITER` to
+  `min(max_iter, 800)`, so CV runs at ~1e-3 even with `--tol 1e-6`.
+  `PHEASY_LASSO_DEBIAS` defaults to 1: `results["coef"]` is an OLS refit on the
+  selected support, not the raw L1 solution.

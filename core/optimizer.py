@@ -683,7 +683,7 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
         y_sub = y_sub[row_idx]
     if _is_linear_operator(A):
         # LSMR on a masked operator: no materialization, memory ~O(n_features).
-        op = _make_masked_op(A, row_idx, col_idx)
+        op_base = _make_masked_op(A, row_idx, col_idx)
         n = len(col_idx)
         atol = float(os.environ.get("PHEASY_LSQR_ATOL", str(
             lsmr_atol if lsmr_atol is not None else 1e-8)))
@@ -696,14 +696,15 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
 
             def mv_aug(v):
                 v = np.asarray(v, dtype=np.float64).ravel()
-                return np.concatenate([np.asarray(op @ v).ravel(), sqrt_a * v])
+                return np.concatenate([np.asarray(op_base @ v).ravel(),
+                                       sqrt_a * v])
 
             def rmv_aug(u):
                 u = np.asarray(u, dtype=np.float64).ravel()
-                return (np.asarray(op.T @ u[: op.shape[0]]).ravel()
-                        + sqrt_a * u[op.shape[0]:])
+                return (np.asarray(op_base.T @ u[: op_base.shape[0]]).ravel()
+                        + sqrt_a * u[op_base.shape[0]:])
 
-            op = LinearOperator((op.shape[0] + n, n), matvec=mv_aug,
+            op = LinearOperator((op_base.shape[0] + n, n), matvec=mv_aug,
                                 rmatvec=rmv_aug, dtype=np.float64)
             y_sub = np.concatenate([y_sub, np.zeros(n)])
         res = _lsmr(op, y_sub, atol=atol, btol=btol, maxiter=maxiter)

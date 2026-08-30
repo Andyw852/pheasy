@@ -592,11 +592,9 @@ class WorkFlow(object):
             if settings.QE:
                 file_format = "qe"
                 rforce_file = "rforce.out"
-                filename_pattern = "DISP.out.{{0:0{0}d}}".format(3)
             else:
                 file_format = "vasp"
                 rforce_file = "rforce.xml"
-                filename_pattern = "vasprun.xml.{{0:0{0}d}}".format(3)
 
             if settings.RFORCE:
                 logger.info("Residual forces of perfect structure will be removed.")
@@ -784,8 +782,8 @@ class WorkFlow(object):
                         SM3_prime = SM3_prime.tocsr()
                     if SM3_prime.dtype != _np_p.float32:
                         SM3_prime = SM3_prime.astype(_np_p.float32)
-                    print(f'[OLS-sparse fix_fc2] SM = SM3_prime @ NS_anharm  '
-                          f'(sparse @ sparse, KEEP SPARSE)', flush=True)
+                    print('[OLS-sparse fix_fc2] SM = SM3_prime @ NS_anharm  '
+                          '(sparse @ sparse, KEEP SPARSE)', flush=True)
                     print(f'[OLS-sparse fix_fc2]   SM3_prime: shape={SM3_prime.shape} '
                           f'fmt={SM3_prime.format} nnz={SM3_prime.nnz} '
                           f'mem={_sp_mem_gb(SM3_prime):.2f} GB', flush=True)
@@ -909,8 +907,8 @@ class WorkFlow(object):
                         SM_prime = SM_prime.astype(_np_p.float32)
                     _sp_mem = _sp_mem_gb(SM_prime)
                     _ns_mem = _sp_mem_gb(_ns)
-                    print(f'[OLS-sparse] SM = SM_prime @ NS_full  '
-                          f'(sparse @ sparse, KEEP SPARSE — no 141 GB densify)',
+                    print('[OLS-sparse] SM = SM_prime @ NS_full  '
+                          '(sparse @ sparse, KEEP SPARSE — no 141 GB densify)',
                           flush=True)
                     print(f'[OLS-sparse]   SM_prime: shape={SM_prime.shape} '
                           f'fmt={SM_prime.format} nnz={SM_prime.nnz} '
@@ -1212,7 +1210,11 @@ class WorkFlow(object):
                 **alpha_kwargs,
             )
             if settings.MODEL.upper() == "LASSO":
-                logger.info("Fitting force constants via the coordinate descent LASSO.")
+                from pheasy.core.optimizer import _lasso_backend as _lb
+                _bk = _lb(SM)
+                logger.info("Fitting force constants via %s LASSO."
+                            % ("coordinate-descent" if _bk == "dense"
+                               else "iterative FISTA"))
             elif settings.MODEL.upper() == "ALASSO":
                 logger.info("Fitting force constants via Adaptive LASSO (ALASSO).")
             elif settings.MODEL.upper() == "OLS":
