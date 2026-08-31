@@ -106,10 +106,12 @@ NCPU="${SLURM_CPUS_PER_TASK:-8}"
 NJOBS=""                # 外层并行度(折/alpha); 留空 = 自动(全核)
 LASSO_SPARSE=0          # PHEASY_LASSO_SPARSE
 LASSO_TWOLEVEL=0        # PHEASY_LASSO_TWOLEVEL
+RASR=BHH                # 旋转声学和规则 BH/H/BHH/None；BHH=Born-Huang+Huang 平衡条件
+DO_RASR=FIT             # RASR 施加方式 FIT=揉进零空间 / PP=事后投影
 
 _ALLOWED="FIT_METHOD FIT_ORDER C2_CUTOFF C3_CUTOFF C4_CUTOFF NULL_SPACE_EPS \
 NDATA FORCE_REBUILD STANDARDIZE LASSO_TOL LASSO_MAX_ITER CV NMU ALPHA_DECADES \
-MU_MIN MU_MAX SM_DTYPE NCPU NJOBS LASSO_SPARSE LASSO_TWOLEVEL"
+MU_MIN MU_MAX SM_DTYPE NCPU NJOBS LASSO_SPARSE LASSO_TWOLEVEL RASR DO_RASR"
 for kv in "$@"; do
   case "$kv" in
     *=*)
@@ -198,6 +200,10 @@ C_FLAG=""
 [ "$FIT_ORDER" -ge 3 ] && [ "$C3_CUTOFF" != "None" ] && [ "$C3_CUTOFF" != "none" ] && C_FLAG="$C_FLAG --c3 $C3_CUTOFF"
 [ "$FIT_ORDER" -ge 4 ] && [ "$C4_CUTOFF" != "None" ] && [ "$C4_CUTOFF" != "none" ] && C_FLAG="$C_FLAG --c4 $C4_CUTOFF"
 W_FLAG="-w $FIT_ORDER"
+RASR_FLAGS=""
+if [ "$RASR" != "None" ] && [ "$RASR" != "none" ] && [ -n "$RASR" ]; then
+  RASR_FLAGS="--rasr $RASR --do_rasr $DO_RASR"
+fi
 
 # pheasy 每次运行都会重写 SPOSCAR（内容不变但 mtime 刷新），所以结构指纹必须
 # 用内容哈希而不是 mtime，否则每跑一次都判定"结构变了"并重建 cluster space。
@@ -208,9 +214,9 @@ _fp_hash() {
 }
 
 # ---------------- 一级指纹：结构 / cutoff（守 cluster space 与 null space）------
-_stamp_struct=$(printf 'dim=%s order=%s c2=%s c3=%s c4=%s eps=%s poscar=%s sposcar=%s' \
+_stamp_struct=$(printf 'dim=%s order=%s c2=%s c3=%s c4=%s eps=%s rasr=%s/%s poscar=%s sposcar=%s' \
   "$DIM" "$FIT_ORDER" "$C2_CUTOFF" "$C3_CUTOFF" "$C4_CUTOFF" "$NULL_SPACE_EPS" \
-  "$(_fp_hash POSCAR)" "$(_fp_hash SPOSCAR)")
+  "$RASR" "$DO_RASR" "$(_fp_hash POSCAR)" "$(_fp_hash SPOSCAR)")
 if [ -f .pheasy_stamp_struct ] && [ "$(cat .pheasy_stamp_struct)" != "$_stamp_struct" ]; then
   echo "结构/截断参数已变化，丢弃 cluster space、null space 与 sensing matrix："
   rm -f $_STRUCT_FILES $_DATA_FILES .pheasy_stamp_data
@@ -237,7 +243,7 @@ fi
 
 if [ ! -f ns_harm.npz ]; then
   echo "[2/4] null space"
-  pheasy --dim $DIM $W_FLAG -c $C_FLAG --eps $NULL_SPACE_EPS || exit 1
+  pheasy --dim $DIM $W_FLAG -c $C_FLAG --eps $NULL_SPACE_EPS $RASR_FLAGS || exit 1
 else
   echo "[2/4] null space 跳过 (ns_harm.npz)"
 fi
@@ -252,7 +258,7 @@ fi
 printf '%s' "$_stamp_data" > .pheasy_stamp_data
 
 echo "[4/4] fit ($FIT_METHOD, ndata=$NDATA)"
-FIT_FLAGS="--full_ifc -l $FIT_METHOD --hdf5"
+FIT_FLAGS="--full_ifc -l $FIT_METHOD --hdf5 $RASR_FLAGS"
 # --std 对 LASSO / ALASSO / RIDGE 都生效。RIDGE 尤其需要：列范数跨度可达 1e2，
 # 不标准化等于对不同项施加差百倍的 L2 惩罚。
 if [ "$STANDARDIZE" = "true" ] && [[ "$FIT_METHOD" =~ ^(LASSO|ALASSO|RIDGE)$ ]]; then

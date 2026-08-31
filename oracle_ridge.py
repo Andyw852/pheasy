@@ -80,9 +80,10 @@ def main():
             val[c * rpc:(c + 1) * rpc] = True
         tr = ~val
         # per-fold standardization (matches holdout _method_fit)
-        col_scale = np.sqrt(np.einsum("ij,ij->j", A64[tr], A64[tr]))
+        Atr = A64[tr]  # materialize the train slice once (bool-index copies)
+        col_scale = np.sqrt(np.einsum("ij,ij->j", Atr, Atr))
         col_scale = np.where(col_scale < 1e-30, 1.0, col_scale)
-        A_tr_s = A64[tr] / col_scale[None, :]
+        A_tr_s = Atr / col_scale[None, :]
         U, s, Vt = np.linalg.svd(A_tr_s, full_matrices=False)
         Uty = U.T @ F[tr]
         A_val_s = A64[val] / col_scale[None, :]
