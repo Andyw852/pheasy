@@ -108,7 +108,9 @@ NCPU="${SLURM_CPUS_PER_TASK:-8}"
 NJOBS=""                # 外层并行度(折/alpha); 留空 = 自动(全核)
 LASSO_SPARSE=0          # PHEASY_LASSO_SPARSE
 LASSO_TWOLEVEL=0        # PHEASY_LASSO_TWOLEVEL
-RASR=BHH                # 旋转声学和规则 BH/H/BHH/None；BHH=Born-Huang+Huang 平衡条件
+RASR=None               # 旋转声学和规则 BH/H/BHH/None
+                        # 注意: 开启会减少自由参数 p(零空间维度变小), 与 RASR=None 的历史结果不可比
+                        # 2D 材料(有 ZA 弯曲支)强烈建议 BHH —— ZA 的 ω∝q² 由旋转不变性保证, 不加 RSR 时 Γ 附近会出现小虚频
 DO_RASR=FIT             # RASR 施加方式 FIT=揉进零空间 / PP=事后投影
 
 _ALLOWED="FIT_METHOD FIT_ORDER C2_CUTOFF C3_CUTOFF C4_CUTOFF NULL_SPACE_EPS \
@@ -129,6 +131,10 @@ done
 case "$FIT_METHOD" in
   OLS|LASSO|ALASSO|RFE|RFE-OLS-TSQR|RIDGE) ;;
   *) echo "FIT_METHOD=$FIT_METHOD 不是合法方法; 可选: OLS LASSO ALASSO RFE RFE-OLS-TSQR RIDGE" >&2; exit 2 ;;
+esac
+case "$RASR" in
+  None|none|BH|H|BHH) ;;
+  *) echo "RASR=$RASR 非法; 可选: None BH H BHH" >&2; exit 2 ;;
 esac
 if [ "$FIT_ORDER" -ge 4 ] && { [ "$C4_CUTOFF" = "None" ] || [ "$C4_CUTOFF" = "none" ]; }; then
   echo "FIT_ORDER=4 但没有设 C4_CUTOFF；四阶不截断会让轨道数爆炸。" >&2
@@ -215,13 +221,22 @@ _fp_hash() {
   else cksum "$1" | cut -d' ' -f1,2 | tr ' ' '_'; fi
 }
 
-# ---------------- 一级指纹：结构 / cutoff（守 cluster space 与 null space）------
-_stamp_struct=$(printf 'dim=%s order=%s c2=%s c3=%s c4=%s eps=%s rasr=%s/%s poscar=%s sposcar=%s' \
+# ---------------- 一级指纹：结构 / cutoff（守 cluster space 与 sensing matrix）------
+_stamp_struct=$(printf 'dim=%s order=%s c2=%s c3=%s c4=%s eps=%s poscar=%s sposcar=%s' \
   "$DIM" "$FIT_ORDER" "$C2_CUTOFF" "$C3_CUTOFF" "$C4_CUTOFF" "$NULL_SPACE_EPS" \
-  "$RASR" "$DO_RASR" "$(_fp_hash POSCAR)" "$(_fp_hash SPOSCAR)")
+  "$(_fp_hash POSCAR)" "$(_fp_hash SPOSCAR)")
 if [ -f .pheasy_stamp_struct ] && [ "$(cat .pheasy_stamp_struct)" != "$_stamp_struct" ]; then
   echo "结构/截断参数已变化，丢弃 cluster space、null space 与 sensing matrix："
-  rm -f $_STRUCT_FILES $_DATA_FILES .pheasy_stamp_data
+  rm -f $_STRUCT_FILES $_DATA_FILES .pheasy_stamp_data .pheasy_stamp_ns
+fi
+
+# ---------------- 一级半指纹：+ RASR（只守 null space）---------------------------
+# RASR 只进零空间构造，不动 cluster space 和 sensing matrix（sm_prime 是位移与
+# cluster space 的产物，NS 是之后才乘上去的）。翻 --rasr 开关只重建 ns_*.npz。
+_stamp_ns=$(printf '%s | rasr=%s/%s' "$_stamp_struct" "$RASR" "$DO_RASR")
+if [ -f .pheasy_stamp_ns ] && [ "$(cat .pheasy_stamp_ns)" != "$_stamp_ns" ]; then
+  echo "RASR 参数已变化，只丢弃 null space（保留 cluster space 与 sensing matrix）："
+  rm -f ns_harm.npz ns_anharm3.npz ns_anharm4.npz
 fi
 
 # ---------------- 二级指纹：数据（守 sensing matrix）---------------------------
@@ -250,6 +265,7 @@ else
   echo "[2/4] null space 跳过 (ns_harm.npz)"
 fi
 printf '%s' "$_stamp_struct" > .pheasy_stamp_struct
+printf '%s' "$_stamp_ns" > .pheasy_stamp_ns
 
 if [ ! -f sm_prime.npz ]; then
   echo "[3/4] sensing matrix (按全部 $SM_NDATA 个构型建表, 供任意 NDATA<=$SM_NDATA 复用)"
