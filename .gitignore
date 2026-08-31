@@ -25,3 +25,9 @@ test/*/phi.npz
 
 # local-only agent notes with real GPU-box identifiers (never commit)
 AGENTS.local.md
+
+# local c7 data mirror + one-off rerun scripts (never commit; contain real GPU paths)
+MnIn2Se4_c7_local/
+_launch_ridge*
+holdout_ridge_n*_s0.out
+
