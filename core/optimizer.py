@@ -50,9 +50,9 @@ def _resolve_n_jobs(method=None, default=-1):
     """Unified outer-parallelism resolver.
 
     Precedence: PHEASY_<METHOD>_N_JOBS > PHEASY_N_JOBS > ``default``.
-    A value <= 0 means "all available cores"; the result is always clamped to
-    [1, _avail_cores()]. Method names use '-' -> '_' (e.g. "RFE-OLS-TSQR" ->
-    "RFE_OLS_TSQR").
+    0 means serial, a value < 0 means "all available cores", and a positive
+    value is clamped to [1, _avail_cores()]. Method names use '-' -> '_'
+    (e.g. "RFE-OLS-TSQR" -> "RFE_OLS_TSQR").
     """
     raw = None
     if method:
@@ -60,6 +60,8 @@ def _resolve_n_jobs(method=None, default=-1):
     if raw in (None, ""):
         raw = os.environ.get("PHEASY_N_JOBS")
     n = int(raw) if raw not in (None, "") else int(default)
+    if n == 0:
+        return 1          # 0 = serial (old behaviour + joblib convention)
     n_cpu = _avail_cores()
     return max(1, min(n if n > 0 else n_cpu, n_cpu))
 
@@ -994,11 +996,15 @@ def _reselect_alpha(model, A, y, sample_weight=None, grid_diag=None):
 
 
 class _OLSModel:
-    def __init__(self, coef, n_iter=None):
+    def __init__(self, coef, n_iter=None, alpha=None):
         self.coef_ = np.asarray(coef)
         self.intercept_ = 0.0
         self.n_features_in_ = self.coef_.shape[0]
         self.n_iter_ = n_iter
+        # [FIX P47] RIDGE stores an _OLSModel (no sklearn model), but
+        # fit.py / holdout_eval.py read alpha_ for the grid-edge flag. Expose it
+        # here as a defensive mirror of o.results["alpha"] (the formal exit).
+        self.alpha_ = alpha
 
     def predict(self, A):
         return np.asarray(A @ self.coef_).ravel()
@@ -2059,20 +2065,26 @@ class Optimizer(object):
                         (_predict_rows(A_fit, c, va) - F64[va]) ** 2))
 
                 mse_path = np.zeros((len(alphas), len(splits)))
-                for j, a in enumerate(alphas):
-                    if n_jobs > 1 and len(splits) > 1:
-                        from joblib import Parallel, delayed
-                        with _blas_limit(min(n_jobs, len(splits))):
-                            errs = Parallel(n_jobs=min(n_jobs, len(splits)),
-                                            prefer="threads")(
+                parallel = n_jobs > 1 and len(splits) > 1
+                n_workers = min(n_jobs, len(splits))
+                if parallel:
+                    from joblib import Parallel, delayed
+                # [FIX P45b] enter _blas_limit ONCE for the whole alpha sweep
+                # instead of per alpha (threadpool_limits walks the loaded BLAS
+                # libraries on every entry/exit).
+                ctx = _blas_limit(n_workers) if parallel else contextlib.nullcontext()
+                with ctx:
+                    for j, a in enumerate(alphas):
+                        if parallel:
+                            errs = Parallel(n_jobs=n_workers, prefer="threads")(
                                 delayed(_fold_rmse)(a, k)
                                 for k in range(len(splits)))
-                    else:
-                        errs = [_fold_rmse(a, k) for k in range(len(splits))]
-                    mse_path[j] = errs
+                        else:
+                            errs = [_fold_rmse(a, k) for k in range(len(splits))]
+                        mse_path[j] = errs
                 best_alpha = float(alphas[int(np.argmin(mse_path.mean(axis=1)))])
                 coef = _ridge_solve(A_fit, F64, best_alpha)
-                self._model = _OLSModel(coef)
+                self._model = _OLSModel(coef, alpha=best_alpha)
                 self._results["alpha"] = best_alpha
                 self._results["mse_path"] = mse_path
             else:
@@ -2099,21 +2111,32 @@ class Optimizer(object):
                     self._model.fit(A_dense, F64, sample_weight=weights)
                     coef = self._model.coef_
                 else:
-                    mse = np.zeros(len(alphas), dtype=np.float64)
-                    for tr, va in splits:
+                    # [FIX P47] weighted ridge == unweighted ridge on
+                    # sqrt(weights)-scaled rows; exact, and the CV folds then
+                    # need no per-fold reweighting.
+                    y_dense = F64
+                    if weights is not None:
+                        sw = np.sqrt(np.asarray(weights, dtype=np.float64).ravel())
+                        A_dense = A_dense * sw[:, None]
+                        y_dense = y_dense * sw
+                    # [FIX P47] mse_path keeps the SAME (n_alphas, n_folds)
+                    # shape as the operator branch (per-fold values), so the two
+                    # paths agree and downstream can read per-fold RMSE.
+                    mse_path = np.zeros((len(alphas), len(splits)), dtype=np.float64)
+                    for k, (tr, va) in enumerate(splits):
                         U, s, Vt = np.linalg.svd(A_dense[tr], full_matrices=False)
-                        Uty = U.T @ F64[tr]
+                        Uty = U.T @ y_dense[tr]
                         AvV = A_dense[va] @ Vt.T
                         for j, a in enumerate(alphas):
                             pred = AvV @ ((s / (s ** 2 + a)) * Uty)
-                            mse[j] += float(np.mean((pred - F64[va]) ** 2))
-                    best_alpha = float(alphas[int(np.argmin(mse))])
+                            mse_path[j, k] = float(np.mean((pred - y_dense[va]) ** 2))
+                    best_alpha = float(alphas[int(np.argmin(mse_path.mean(axis=1)))])
                     # final refit at the selected alpha (closed form, full data)
                     U, s, Vt = np.linalg.svd(A_dense, full_matrices=False)
-                    coef = Vt.T @ ((s / (s ** 2 + best_alpha)) * (U.T @ F64))
-                    self._model = _OLSModel(coef)
+                    coef = Vt.T @ ((s / (s ** 2 + best_alpha)) * (U.T @ y_dense))
+                    self._model = _OLSModel(coef, alpha=best_alpha)
                     self._results["alpha"] = best_alpha
-                    self._results["mse_path"] = mse
+                    self._results["mse_path"] = mse_path
         else:
             raise ValueError(
                 "Unknown linear model for fitting force constants: {} ".format(self._method)

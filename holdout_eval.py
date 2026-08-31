@@ -153,7 +153,9 @@ def _method_fit(method, A, y):
     if method == "RIDGE":
         # same edge detection we spent many rounds giving ALASSO: the control is
         # useless if CV picked a grid edge (wants outside the grid).
-        a = float(o._model.alpha_)
+        # [FIX P47] use the formal exit o.results["alpha"] (RIDGE stores a plain
+        # _OLSModel, whose alpha_ is a best-effort mirror, not the source of truth).
+        a = float(o.results["alpha"])
         if a <= RIDGE_BASE[0] * (1.0 + 1e-9):
             flag += ("+" if flag else "") + "R@lo"
         elif a >= RIDGE_BASE[-1] * (1.0 - 1e-9):

@@ -106,7 +106,8 @@ def fit_method(method, A, y):
         if _bf is not None:
             flag += ("+" if flag else "") + "F%.2f" % float(_bf)
     if method == "RIDGE":
-        a = float(o._model.alpha_)
+        # [FIX P47] formal exit (RIDGE's _OLSModel may not carry alpha_).
+        a = float(o.results["alpha"])
         if a <= RIDGE_BASE[0] * (1.0 + 1e-9):
             flag += ("+" if flag else "") + "R@lo"
         elif a >= RIDGE_BASE[-1] * (1.0 - 1e-9):
