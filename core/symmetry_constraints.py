@@ -374,7 +374,12 @@ class SymmetryConstraints(object):
                         ns_new.eliminate_zeros()
                     return ns_new
 
-                _use_eliminate = _os.environ.get("PHEASY_ASR_ELIMINATE", "1") == "1"
+                # [B1] elimination requires the sparse path: _eliminate_row
+                # assumes sparse (b_row.toarray(), (ns @ E).tocsc()).  With
+                # PHEASY_ASR_SPARSE=0 ns_mat is a dense ndarray and those calls
+                # raise AttributeError.  Gate it so the two switches cannot combine.
+                _use_eliminate = (_os.environ.get("PHEASY_ASR_ELIMINATE", "1") == "1"
+                                  and _use_sparse)
                 if _use_eliminate:
                     # Sparse column elimination: dimension-reducing, sparse-preserving.
                     # Processes each constraint row independently; dependent rows
@@ -384,11 +389,18 @@ class SymmetryConstraints(object):
                           f'{_total_rows} constraint rows)', flush=True)
                     import time as _time
                     _t0 = _time.time()
+                    _eliminated = 0
+                    _skipped = 0
                     for _ci, _cm in enumerate(cons_asr):
                         for _ri in range(_cm.shape[0]):
                             _row = _cm.getrow(_ri)
                             _b = _row.dot(ns_mat)
+                            _n_before = ns_mat.shape[1]
                             ns_mat = _eliminate_row(ns_mat, _b, self._eps)
+                            if ns_mat.shape[1] == _n_before - 1:
+                                _eliminated += 1
+                            elif ns_mat.shape[1] == _n_before:
+                                _skipped += 1
                             if ns_mat.shape[1] == 0:
                                 break
                         if ns_mat.shape[1] > 0:
@@ -400,6 +412,21 @@ class SymmetryConstraints(object):
                                   f't={_time.time()-_t0:.1f}s', flush=True)
                         if ns_mat.shape[1] == 0:
                             break
+                    # [B3] post-elimination verification. max|C@ns| is the
+                    # acceptance criterion (should be ~1e-10); eliminated+skipped
+                    # must equal total_rows unless the loop early-broke at 0 cols.
+                    _res = 0.0
+                    if ns_mat.shape[1] > 0:
+                        for _cm in cons_asr:
+                            if _cm.shape[0] > 0:
+                                _res = max(_res, float(abs(_cm.dot(ns_mat)).max()))
+                    print(f'[ASR] done: n_free={ns_mat.shape[1]}, '
+                          f'eliminated={_eliminated}, skipped={_skipped}, '
+                          f'max|C@ns|={_res:.2e}', flush=True)
+                    if _eliminated + _skipped != _total_rows:
+                        print(f'[ASR] WARNING: eliminated+skipped='
+                              f'{_eliminated + _skipped} != total_rows={_total_rows} '
+                              f'(early break?)', flush=True)
                 elif _use_combined and len(cons_asr) > 1:
                     # Adaptive chunked SVD: split constraints so each chunk's
                     # lwork ~ 2 * chunk_rows * n_free stays under INT32_MAX.

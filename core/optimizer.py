@@ -76,12 +76,19 @@ def _blas_limit(n_outer):
     degrades to a no-op instead of raising.
     """
     per = max(1, _avail_cores() // max(1, n_outer))
+    # Import OUTSIDE the yield scope: a `yield` inside `try` means any
+    # ImportError raised by the *body* (inside `with _blas_limit`) would be
+    # caught here and trigger a second yield -> "RuntimeError: generator
+    # didn't stop after throw()", destroying the original error.
     try:
         from threadpoolctl import threadpool_limits
+    except ImportError:
+        threadpool_limits = None
+    if threadpool_limits is None:
+        yield
+    else:
         with threadpool_limits(limits=per):
             yield
-    except ImportError:
-        yield
 
 
 def _to_dense_f64(A):
