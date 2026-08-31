@@ -202,33 +202,59 @@ def build_sensing_matrix(cluster_space, u_vecs):
         Sensing matrix of input displaced structure.
 
     """
+    from scipy import sparse as sp
+
     max_order = cluster_space.max_order
     natoms = len(u_vecs)
     u_vecs_1d = u_vecs.flatten()
     clusters = cluster_space.get_cluster_space()
 
-    sensing_mat_block = deque()
+    # [FIX] accumulate COO triples directly instead of materializing a
+    # (natoms*3, ifc_num) dense block per orbit then np.hstack'ing them.
+    # A 3rd-order cluster touches only 3*order rows (6/9), but the old code
+    # allocated (natoms*3, ifc_num) and ran block.dot(Gamma) over ALL 1488
+    # rows -> 165-250x wasted flops, plus an extra 790MB hstack copy.
+    rows_list, cols_list, data_list = [], [], []
+    col_offset = 0
     for order in range(2, max_order + 1):
         shape = [3] * order
-        ifc_num = np.power(3, order)
-        col = np.tile(range(ifc_num), order)
+        ifc_num = 3 ** order
+        col = np.tile(np.arange(ifc_num), order)
+        components = np.array(list(np.ndindex(*shape)))   # (ifc_num, order) 0/1/2
+        local_base = (np.arange(order) * 3)[None, :]      # (1, order)
+        n_loc = 3 * order
         for orbit in clusters[order]:
-            block = np.zeros((natoms * 3, ifc_num))
             for cluster in orbit[1:]:
-                block_tmp = np.zeros((natoms * 3, ifc_num))
-                comp_list = np.array(cluster.atom_index) * 3 + list(np.ndindex(*shape))
-                row = comp_list.T.flatten()
-                comp_list = np.hstack(
+                atom_index = np.asarray(cluster.atom_index)          # (order,)
+                comp_list = atom_index[None, :] * 3 + components     # (ifc_num, order)
+                reduced = np.hstack(
                     [np.delete(comp_list, i, 1) for i in range(order)]
                 ).reshape(ifc_num, order, order - 1)
-                u_prods = np.prod(np.take(u_vecs_1d, comp_list), axis=2)
-                np.add.at(block_tmp, (row, col), u_prods.T.flatten())
+                u_prods = np.prod(np.take(u_vecs_1d, reduced), axis=2)
+                local_row = (local_base + components).T.flatten()    # (order*ifc_num,)
+                sub = np.zeros((n_loc, ifc_num))
+                np.add.at(sub, (local_row, col), u_prods.T.flatten())
                 Gamma = cluster.get_crotation_tensor().toarray()
-                block_tmp = -block_tmp.dot(Gamma) / cluster.cluster_factorial()
-                block += block_tmp
-            sensing_mat_block.append(block)
+                sub = -sub.dot(Gamma) / cluster.cluster_factorial()
+                global_row = (atom_index[:, None] * 3
+                              + np.arange(3)[None, :]).flatten()     # (n_loc,)
+                nz = np.nonzero(sub)
+                if nz[0].size:
+                    rows_list.append(global_row[nz[0]])
+                    cols_list.append(col_offset + nz[1])
+                    data_list.append(sub[nz[0], nz[1]])
+            col_offset += ifc_num
 
-    return np.hstack(sensing_mat_block)
+    if not rows_list:
+        return sp.coo_matrix((natoms * 3, col_offset), dtype=np.float64)
+    coo = sp.coo_matrix(
+        (np.concatenate(data_list),
+         (np.concatenate(rows_list), np.concatenate(cols_list))),
+        shape=(natoms * 3, col_offset))
+    # repeated atoms / symmetry-equivalent clusters scatter the same (row,col)
+    # from different local entries; sum them (matches the old in-place add.at)
+    coo.sum_duplicates()
+    return coo
 
 
 def build_sensing_matrix_slow(cluster_space, u_vecs):
