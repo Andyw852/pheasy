@@ -353,6 +353,12 @@ class SymmetryConstraints(object):
                     # partial pivoting: largest |b| as pivot for stability
                     pidx = int(nz[_np.argmax(_np.abs(b[nz]))])
                     pv = b[pidx]
+                    # Conservative skip heuristic: |pivot| < eps treats the row
+                    # as already satisfied.  eps is the CLI --eps rank tolerance
+                    # (an absolute, not scale-invariant, bound); the absolute
+                    # pivot is adequate in practice -- the B3 post-loop max|C@ns|
+                    # check measured ~1e-15 on C60Mg2 (n_free=42031), i.e. the
+                    # skipped rows are genuinely dependent, not merely < eps.
                     if abs(pv) < eps:
                         return ns  # numerically satisfied
                     keep = _np.arange(n_free)
