@@ -9,6 +9,7 @@ References:
   F. Eriksson et al., Adv. Theory Simul. 2 (2019) (hiphive).
   J. Demmel et al., SIAM J. Sci. Comput. 34 (2012) A206 (TSQR).
 """
+import contextlib
 import os
 
 import numpy as np
@@ -26,6 +27,59 @@ from sklearn.metrics import (
 from sklearn.model_selection import GroupKFold, KFold
 
 __all__ = ["Optimizer", "TwoLevelSM"]
+
+
+def _avail_cores():
+    """Usable CPU count for THIS job (affinity/cgroup aware), not the node's.
+
+    os.cpu_count() reports the node's physical core count, which on a shared
+    Slurm box overstates what --cpus-per-task actually granted. Prefer the
+    process's CPU affinity; PHEASY_MAX_CORES overrides both (the shell sets it
+    to $NCPU so the code never guesses the node width).
+    """
+    n = os.environ.get("PHEASY_MAX_CORES")
+    if n:
+        return max(1, int(n))
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
+
+
+def _resolve_n_jobs(method=None, default=-1):
+    """Unified outer-parallelism resolver.
+
+    Precedence: PHEASY_<METHOD>_N_JOBS > PHEASY_N_JOBS > ``default``.
+    A value <= 0 means "all available cores"; the result is always clamped to
+    [1, _avail_cores()]. Method names use '-' -> '_' (e.g. "RFE-OLS-TSQR" ->
+    "RFE_OLS_TSQR").
+    """
+    raw = None
+    if method:
+        raw = os.environ.get("PHEASY_%s_N_JOBS" % method.upper().replace("-", "_"))
+    if raw in (None, ""):
+        raw = os.environ.get("PHEASY_N_JOBS")
+    n = int(raw) if raw not in (None, "") else int(default)
+    n_cpu = _avail_cores()
+    return max(1, min(n if n > 0 else n_cpu, n_cpu))
+
+
+@contextlib.contextmanager
+def _blas_limit(n_outer):
+    """Cap each worker's BLAS threads when the OUTER loop already runs n_outer.
+
+    Without this, K outer folds x many inner BLAS threads oversubscribe the box
+    and can be slower than serial. threadpool_limits sets the limit for the
+    current process (all joblib threads see it); a missing threadpoolctl
+    degrades to a no-op instead of raising.
+    """
+    per = max(1, _avail_cores() // max(1, n_outer))
+    try:
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=per):
+            yield
+    except ImportError:
+        yield
 
 
 def _to_dense_f64(A):
@@ -635,8 +689,13 @@ def _row_slice(A, rows):
     return A[rows]
 
 
-def _ridge_solve(A, y, alpha):
-    """min ||A x - y||^2 + alpha||x||^2 for dense / sparse / LinearOperator."""
+def _ridge_solve(A, y, alpha, x0=None):
+    """min ||A x - y||^2 + alpha||x||^2 for dense / sparse / LinearOperator.
+
+    ``x0`` is a warm-start for the iterative (LinearOperator) branch: the alpha
+    path walks large->small, so neighbouring alphas have nearly identical
+    solutions and LSMR converges in a fraction of the cold-start iterations.
+    """
     y64 = np.asarray(y, dtype=np.float64).ravel()
     if _is_linear_operator(A):
         n = A.shape[1]
@@ -660,7 +719,7 @@ def _ridge_solve(A, y, alpha):
         atol = float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8"))
         btol = float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8"))
         maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
-        res = _lsmr(op, y_aug, atol=atol, btol=btol, maxiter=maxiter)
+        res = _lsmr(op, y_aug, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
         return np.asarray(res[0], dtype=np.float64)
     if alpha > 0:
         ridge = Ridge(alpha=alpha, fit_intercept=False, solver="auto")
@@ -719,6 +778,17 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
         ridge.fit(A_sub, y_sub)
         return ridge.coef_
     if qr:
+        # [FIX P45] TSQR only pays off when the dense block does not fit in
+        # memory. On a small matrix (the common case) the whole thing is one
+        # block, so the tree-reduction pays all of its bookkeeping overhead for
+        # zero gain AND parallelizes worse than a single LAPACK gelsd. Judge by
+        # BYTES (not rows): gelsd must materialize A_sub plus its workspace, so
+        # the same row count is a very different footprint at p=200 vs p=4000.
+        # PHEASY_TSQR_FORCE=1 keeps the QR path for A/B cross-checks.
+        _bytes = A_sub.shape[0] * A_sub.shape[1] * 8
+        _thr = float(os.environ.get("PHEASY_TSQR_MIN_BYTES", "8e9"))
+        if _bytes <= _thr and os.environ.get("PHEASY_TSQR_FORCE", "0") != "1":
+            return _solve_lstsq(A_sub, y_sub)
         return _solve_qr(A_sub, y_sub, block_rows=block_rows,
                          diag_floor=diag_floor)
     return _solve_lstsq(A_sub, y_sub)
@@ -734,15 +804,31 @@ def _predict_subset(A, col_idx, row_idx, coef):
     return np.asarray(A_sub @ coef).ravel()
 
 
-def _cv_rmse(A, y, idx, solve, splits):
-    """K-fold CV RMSE (mean, standard error, per-fold) for active columns idx."""
+def _cv_rmse(A, y, idx, solve, splits, n_jobs=1):
+    """K-fold CV RMSE (mean, standard error, per-fold) for active columns idx.
+
+    [FIX P45] folds are independent, so parallelize them with THREADS (not the
+    default loky processes): each solve slices A[:, col_idx][row_idx] and a
+    process worker would copy that block N ways (OOM on many-core hosts);
+    threads share A, and the time is spent in LAPACK/scipy where the GIL is
+    released anyway.
+    """
     y64 = np.asarray(y, dtype=np.float64).ravel()
-    fold = np.empty(len(splits), dtype=np.float64)
-    for k, (tr, va) in enumerate(splits):
+
+    def _one(tr, va):
         coef = solve(idx, tr)
-        pred = _predict_subset(A, idx, va, coef)
-        err = pred - y64[va]
-        fold[k] = np.sqrt(np.mean(err * err))
+        err = _predict_subset(A, idx, va, coef) - y64[va]
+        return float(np.sqrt(np.mean(err * err)))
+
+    if n_jobs > 1 and len(splits) > 1:
+        from joblib import Parallel, delayed
+        with _blas_limit(min(n_jobs, len(splits))):
+            fold = np.asarray(Parallel(n_jobs=min(n_jobs, len(splits)),
+                                       prefer="threads")(
+                delayed(_one)(tr, va) for tr, va in splits), dtype=np.float64)
+    else:
+        fold = np.asarray([_one(tr, va) for tr, va in splits], dtype=np.float64)
+
     mean = float(fold.mean())
     se = float(fold.std(ddof=1) / np.sqrt(len(fold))) if len(fold) > 1 else 0.0
     return mean, se, fold
@@ -926,12 +1012,10 @@ def _lasso_n_jobs(A):
     so N=-1 (one worker per core) on a many-core host blows up memory and the
     OOM killer SIGTERMs the run. Default to a memory-aware, bounded worker count.
     """
-    n = int(os.environ.get("PHEASY_N_JOBS", "-1"))
-    if n in (0, 1):
+    n = _resolve_n_jobs("LASSO")
+    if n == 1:
         return 1
-    n_cpu = int(os.environ.get("PHEASY_MAX_CORES", str(os.cpu_count() or 1)))
-    if n < 0:
-        n = n_cpu
+    n_cpu = _avail_cores()
     n = min(n, n_cpu)
     try:
         per_worker = int(A.shape[0]) * int(A.shape[1]) * 8
@@ -939,7 +1023,10 @@ def _lasso_n_jobs(A):
         cap = max(1, int(budget // max(per_worker, 1)))
     except Exception:
         cap = 4
-    return max(1, min(n, cap, 16))
+    # [FIX P24b] the 16-worker ceiling was hardcoded; it underuses a many-core
+    # box. Keep a memory cap but let the ceiling be raised explicitly.
+    _hi = int(os.environ.get("PHEASY_LASSO_MAX_WORKERS", "16"))
+    return max(1, min(n, cap, _hi))
 
 
 def _predict_rows(A, coef, rows):
@@ -960,7 +1047,7 @@ class _LassoCVIterative:
     the dense sklearn path. It is auto-selected only when the dense SM does not
     fit in memory (_lasso_backend); PHEASY_LASSO_TWOLEVEL stays off by default.
     """
-    def __init__(self, alphas, cv, tol, max_iter, rand_seed, n_jobs=1,
+    def __init__(self, alphas, cv, tol, max_iter, rand_seed, n_jobs=None,
                  fit_intercept=False, group_size=None, selection="cyclic",
                  penalty_weights=None, grid_diag=None):
         # [FIX P40] sort ascending: the alpha walk assumes smallest-first and
@@ -972,7 +1059,10 @@ class _LassoCVIterative:
         self.tol = tol
         self.max_iter = int(max_iter)
         self.rand_seed = rand_seed
-        self.n_jobs = int(n_jobs)
+        # [FIX P45] thread-fold parallelism, resolved independently of the
+        # dense sklearn _lasso_n_jobs memory cap (threads share A, so there is
+        # no per-worker matrix copy to budget against).
+        self.n_jobs = _resolve_n_jobs("LASSO", n_jobs if n_jobs is not None else -1)
         self.fit_intercept = fit_intercept
         self.group_size = group_size
         self.selection = selection
@@ -1074,10 +1164,17 @@ class _LassoCVIterative:
         _cv_info = {}
         _cv_max_n_iter = 0
 
+        n_jobs = min(self.n_jobs, len(splits))
         for a_i in range(n_alphas - 1, -1, -1):  # descending: large alpha first
             alpha = float(self.alphas[a_i])
-            fold_mse = np.zeros(len(splits))
-            for k, (tr, va) in enumerate(splits):
+
+            # [FIX P45] the alpha path is a warm-start chain (each fold's
+            # solution seeds the next alpha), so only FOLDS -- never alphas --
+            # may run in parallel. Each fold reads/writes its own x_folds[k] and
+            # its own _info dict, so the workers share no mutable state.
+            def _fold_fit(k):
+                tr, va = splits[k]
+                info = {}
                 if use_gram:
                     # [FIX P34] the Gram encodes A[tr], so pass the TRAIN fold's
                     # row count: the L1 threshold is (n_tr * alpha), not
@@ -1088,7 +1185,7 @@ class _LassoCVIterative:
                                         lipschitz=lip_folds[k],
                                         penalty_weights=self.penalty_weights,
                                         gram=gram_folds[k],
-                                        n_samples=len(tr), _info=_cv_info)
+                                        n_samples=len(tr), _info=info)
                     pred = np.asarray(A_va_list[k] @ coef, dtype=np.float64).ravel()
                 else:
                     if A_folds is not None:
@@ -1103,12 +1200,23 @@ class _LassoCVIterative:
                                         max_iter=cv_max_iter, tol=cv_tol,
                                         lipschitz=self._lipschitz,
                                         penalty_weights=self.penalty_weights,
-                                        _info=_cv_info)
+                                        _info=info)
                     pred = _predict_rows(A, coef, va)
-                x_folds[k] = coef
-                _cv_max_n_iter = max(_cv_max_n_iter, _cv_info.get("n_iter", 0))
                 err = pred - y64[va]
-                fold_mse[k] = float(np.mean(err * err))
+                return float(np.mean(err * err)), coef, int(info.get("n_iter", 0))
+
+            if n_jobs > 1:
+                from joblib import Parallel, delayed
+                with _blas_limit(n_jobs):
+                    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                        delayed(_fold_fit)(k) for k in range(len(splits)))
+            else:
+                results = [_fold_fit(k) for k in range(len(splits))]
+            fold_mse = np.zeros(len(splits))
+            for k, (mse_k, coef, n_it) in enumerate(results):
+                fold_mse[k] = mse_k
+                x_folds[k] = coef
+                _cv_max_n_iter = max(_cv_max_n_iter, n_it)
             mse_path[a_i] = fold_mse
             mean = float(fold_mse.mean())
             # warm-start the next (smaller) alpha from this alpha's full fit
@@ -1235,7 +1343,7 @@ class _LassoCVModel:
         if _lasso_backend(A) == "iterative":
             it = _LassoCVIterative(
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
-                self.n_jobs, fit_intercept=self.fit_intercept,
+                None, fit_intercept=self.fit_intercept,
                 group_size=self.group_size, selection=self.selection)
             it.fit(A, y, sample_weight=sample_weight)
             self.model_ = it
@@ -1471,7 +1579,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
             # ||A / w||^2 and make FISTA crawl on the ill-conditioned matrix.
             it = _LassoCVIterative(
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
-                self.n_jobs, fit_intercept=self.fit_intercept,
+                None, fit_intercept=self.fit_intercept,
                 group_size=self.group_size, selection=self.selection,
                 penalty_weights=self._weights, grid_diag=_grid_diag)
             it.fit(A, y, sample_weight=sample_weight)
@@ -1552,14 +1660,14 @@ class _RFECVBase:
     actual contribution to the fit.
     """
 
-    def __init__(self, step=0.1, cv=5, min_features=1, n_jobs=-1,
+    def __init__(self, step=0.1, cv=5, min_features=1, n_jobs=None,
                  verbose=False, random_state=None, solver="lstsq", ridge_alpha=0.0,
                  patience=5, lsmr_maxiter=5000, lsmr_atol=1e-8, lsmr_btol=1e-8,
                  block_rows=None, diag_floor=1e-12):
         self.step = float(step)
         self.cv = int(cv)
         self.min_features = int(min_features)
-        self.n_jobs = int(n_jobs)
+        self.n_jobs = _resolve_n_jobs("RFE", n_jobs if n_jobs is not None else -1)
         self.verbose = verbose
         self.random_state = random_state
         self.ridge_alpha = float(ridge_alpha)
@@ -1671,7 +1779,8 @@ class _RFECVBase:
                 else:
                     no_improve += 1
             else:
-                cv_mean, cv_se, _ = _cv_rmse(A, y, idx, solve, splits)
+                cv_mean, cv_se, _ = _cv_rmse(A, y, idx, solve, splits,
+                                                n_jobs=self.n_jobs)
                 history.append((n_active, cv_mean, cv_se, active.copy()))
                 if self.verbose:
                     print(f"[RFE] Round {round_num:3d}: n_active={n_active:5d}  "
@@ -1705,7 +1814,8 @@ class _RFECVBase:
             best_support = history_bic[best_round][2]
             # CV once for the selected round (report only)
             _sel = np.where(best_support)[0]
-            best_mean, best_se, _ = _cv_rmse(A, y, _sel, solve, splits)
+            best_mean, best_se, _ = _cv_rmse(A, y, _sel, solve, splits,
+                                                n_jobs=self.n_jobs)
             if self.verbose:
                 print("[RFE] %s min: n_active=%d, %s=%.2e" % (criterion.upper(), n_best, criterion.upper(), history_bic[best_round][1]), flush=True)
                 print("[RFE] selected: n_active=%d, CV_RMSE=%.6e (+-%.2e)" % (n_best, best_mean, best_se), flush=True)
@@ -1743,7 +1853,7 @@ class PheasyRFECV(_RFECVBase):
     """RFE with an OLS (optionally ridge-regularized) base estimator."""
 
     def __init__(self, step=0.05, cv=5, ridge_alpha=0.0, lsmr_maxiter=3000,   # [FIX P21]
-                 lsmr_atol=1e-8, lsmr_btol=1e-8, n_jobs=-1, min_features=1,
+                 lsmr_atol=1e-8, lsmr_btol=1e-8, n_jobs=None, min_features=1,
                  verbose=True, random_state=None, patience=5):
         # [FIX P09] lsmr_* used to be dropped here
         super().__init__(step=step, cv=cv, min_features=min_features, n_jobs=n_jobs,
@@ -1766,7 +1876,7 @@ class PheasyRFE_OLS_TSQR(_RFECVBase):
 
     def __init__(self, step=0.05, patience=5, min_features=100, block_rows=40000,
                  diag_floor=1e-12, cv=5, verbose=True,
-                 random_state=None, n_jobs=-1):
+                 random_state=None, n_jobs=None):
         super().__init__(step=step, cv=cv, min_features=min_features, n_jobs=n_jobs,
                          verbose=verbose, random_state=random_state,
                          solver="qr", ridge_alpha=0.0, patience=patience,
@@ -1902,7 +2012,7 @@ class Optimizer(object):
                 step=float(os.environ.get("PHEASY_RFE_STEP", "0.05")),  # [FIX P21]
                 cv=self._cv,
                 ridge_alpha=float(os.environ.get("PHEASY_RFE_RIDGE_ALPHA", "0")),
-                n_jobs=int(os.environ.get("PHEASY_N_JOBS", "-1")),
+                n_jobs=None,  # resolved via PHEASY_RFE_N_JOBS / PHEASY_N_JOBS
                 min_features=int(os.environ.get("PHEASY_RFE_MIN_FEATURES", "1")),
                 patience=int(os.environ.get("PHEASY_RFE_PATIENCE", "5")),
                 lsmr_maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")),
@@ -1927,29 +2037,83 @@ class Optimizer(object):
             self._model.fit(A, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "RIDGE":
+            alphas = np.sort(np.asarray(self._alpha, dtype=np.float64))[::-1]
             if _is_linear_operator(A_fit):
-                # [FIX P26] ridge CV over the alpha grid on the two-level
+                # [FIX P26/P45] ridge CV over the alpha grid on the two-level
                 # operator via _ridge_solve (LSMR on the augmented system).
+                # (1) row slices are hoisted out of the alpha loop; (2) the
+                # alpha path walks large->small with LSMR warm-start; (3) folds
+                # are parallelized with threads (alpha stays serial).
                 splits = _make_cv_splits(A.shape[0], self._cv, self._rand_seed,
                                          self._group_size)
-                best_alpha = float(self._alpha[0])
-                best_mse = float("inf")
-                for a in self._alpha:
-                    mse = 0.0
-                    for tr, va in splits:
-                        c = _ridge_solve(_row_slice(A_fit, tr), F64[tr], a)
-                        mse += float(np.mean((_predict_rows(A_fit, c, va) - F64[va]) ** 2))
-                    mse /= len(splits)
-                    if mse < best_mse:
-                        best_mse = mse
-                        best_alpha = float(a)
+                n_jobs = _resolve_n_jobs("RIDGE")
+                A_tr_list = [_row_slice(A_fit, tr) for tr, _ in splits]
+                y_tr_list = [F64[tr] for tr, _ in splits]
+                warm = [None] * len(splits)
+
+                def _fold_rmse(a, k):
+                    c = _ridge_solve(A_tr_list[k], y_tr_list[k], a, x0=warm[k])
+                    warm[k] = c
+                    va = splits[k][1]
+                    return float(np.mean(
+                        (_predict_rows(A_fit, c, va) - F64[va]) ** 2))
+
+                mse_path = np.zeros((len(alphas), len(splits)))
+                for j, a in enumerate(alphas):
+                    if n_jobs > 1 and len(splits) > 1:
+                        from joblib import Parallel, delayed
+                        with _blas_limit(min(n_jobs, len(splits))):
+                            errs = Parallel(n_jobs=min(n_jobs, len(splits)),
+                                            prefer="threads")(
+                                delayed(_fold_rmse)(a, k)
+                                for k in range(len(splits)))
+                    else:
+                        errs = [_fold_rmse(a, k) for k in range(len(splits))]
+                    mse_path[j] = errs
+                best_alpha = float(alphas[int(np.argmin(mse_path.mean(axis=1)))])
                 coef = _ridge_solve(A_fit, F64, best_alpha)
                 self._model = _OLSModel(coef)
                 self._results["alpha"] = best_alpha
+                self._results["mse_path"] = mse_path
             else:
-                self._model = RidgeCV(alphas=self._alpha, fit_intercept=self._fit_intercept)
-                self._model.fit(A_fit, F64, sample_weight=weights)
-                coef = self._model.coef_
+                # [FIX P46] dense ridge CV: one economic SVD per fold evaluates
+                # the WHOLE alpha grid in closed form
+                # (w = V diag(s/(s^2+a)) U^T y), and the splits are the same
+                # grouped CV every other method uses. The old RidgeCV(alphas=,
+                # no cv=) ran leave-one-out GCV: it ignored --cv and
+                # PHEASY_CV_GROUP_SIZE, and row-wise LOO leaks the other 3N-1
+                # rows of the same configuration into training (biasing alpha*
+                # toward 0).
+                if sp.issparse(A_fit):
+                    A_dense = _to_dense_f64(A_fit)
+                else:
+                    A_dense = np.ascontiguousarray(A_fit, dtype=np.float64)
+                splits = _make_cv_splits(A_dense.shape[0], self._cv,
+                                         self._rand_seed, self._group_size)
+                if self._fit_intercept:
+                    # grouped CV still fixes the leak; RidgeCV handles the
+                    # intercept the closed form below does not (pheasy CLI
+                    # leaves fit_intercept=False).
+                    self._model = RidgeCV(alphas=self._alpha, fit_intercept=True,
+                                          cv=splits)
+                    self._model.fit(A_dense, F64, sample_weight=weights)
+                    coef = self._model.coef_
+                else:
+                    mse = np.zeros(len(alphas), dtype=np.float64)
+                    for tr, va in splits:
+                        U, s, Vt = np.linalg.svd(A_dense[tr], full_matrices=False)
+                        Uty = U.T @ F64[tr]
+                        AvV = A_dense[va] @ Vt.T
+                        for j, a in enumerate(alphas):
+                            pred = AvV @ ((s / (s ** 2 + a)) * Uty)
+                            mse[j] += float(np.mean((pred - F64[va]) ** 2))
+                    best_alpha = float(alphas[int(np.argmin(mse))])
+                    # final refit at the selected alpha (closed form, full data)
+                    U, s, Vt = np.linalg.svd(A_dense, full_matrices=False)
+                    coef = Vt.T @ ((s / (s ** 2 + best_alpha)) * (U.T @ F64))
+                    self._model = _OLSModel(coef)
+                    self._results["alpha"] = best_alpha
+                    self._results["mse_path"] = mse
         else:
             raise ValueError(
                 "Unknown linear model for fitting force constants: {} ".format(self._method)

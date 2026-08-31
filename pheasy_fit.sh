@@ -14,7 +14,9 @@
 #  │  ALASSO         自适应 LASSO (Zou 2006)：初始岭估计 → 自适应权重 →  │
 #  │                 LASSO。比 LASSO 更少收缩偏差。                     │
 #  │  RFE            递归特征消除：scale-invariant 重要性 + 分组 CV。    │
-#  │  RFE-OLS-TSQR   RFE + 高瘦 QR (Q-less tree TSQR)，超大规模专用。   │
+#  │  RFE-OLS-TSQR   RFE + Q-less tree TSQR。仅当稠密块放不下内存时才用;│
+#  │                 默认 cv 判停下与 RFE 数值等价, 小体系上慢约 2× 且    │
+#  │                 并行加速受限 (2.4× vs 9.3×)。                      │
 #  │  RIDGE          L2 岭回归 (CV 选 alpha)。                          │
 #  └─────────────────────────────────────────────────────────────────────┘
 #
@@ -43,7 +45,8 @@
 #  │   MU_MIN/MU_MAX  RIDGE 手动网格 10^min..10^max  (默认 -6/-2)       │
 #  │ 【内存 / 并行】                                                      │
 #  │   SM_DTYPE       sensing matrix 精度 float32/64 (默认 float32)     │
-#  │   NCPU           线程数 / joblib worker 数      (默认 8)           │
+#  │   NCPU           总核数(BLAS 线程 + 各方法外层并行上限)             │
+#  │   NJOBS          外层并行度(折/alpha); 留空 = 自动                  │
 #  │   LASSO_SPARSE   PHEASY_LASSO_SPARSE=1 走稀疏 SM(默认 0=稠密)      │
 #  │   LASSO_TWOLEVEL PHEASY_LASSO_TWOLEVEL=1 两级matvec(连稀疏乘积都不  │
 #  │                  物化，仅当稀疏乘积也放不下内存时才划算)            │
@@ -99,13 +102,14 @@ ALPHA_DECADES=4.0
 MU_MIN=-6
 MU_MAX=-2
 SM_DTYPE=float32
-NCPU=8
+NCPU="${SLURM_CPUS_PER_TASK:-8}"
+NJOBS=""                # 外层并行度(折/alpha); 留空 = 自动(全核)
 LASSO_SPARSE=0          # PHEASY_LASSO_SPARSE
 LASSO_TWOLEVEL=0        # PHEASY_LASSO_TWOLEVEL
 
 _ALLOWED="FIT_METHOD FIT_ORDER C2_CUTOFF C3_CUTOFF C4_CUTOFF NULL_SPACE_EPS \
 NDATA FORCE_REBUILD STANDARDIZE LASSO_TOL LASSO_MAX_ITER CV NMU ALPHA_DECADES \
-MU_MIN MU_MAX SM_DTYPE NCPU LASSO_SPARSE LASSO_TWOLEVEL"
+MU_MIN MU_MAX SM_DTYPE NCPU NJOBS LASSO_SPARSE LASSO_TWOLEVEL"
 for kv in "$@"; do
   case "$kv" in
     *=*)
@@ -133,7 +137,12 @@ for f in POSCAR SPOSCAR disp_matrix.pkl force_matrix.pkl; do
 done
 
 export OPENBLAS_NUM_THREADS="$NCPU" OMP_NUM_THREADS="$NCPU" MKL_NUM_THREADS="$NCPU"
-export PHEASY_N_JOBS="$NCPU"
+# PHEASY_MAX_CORES 是"本作业可用核数"的唯一权威来源；不导出时代码会按
+# os.cpu_count()(节点物理核数, Slurm 上通常是 192) 计算并行度和内存预算。
+export PHEASY_MAX_CORES="$NCPU"
+# 外层(折/alpha)并行度；留空时仍给 run_pheasy 的传感矩阵构建(它用
+# PHEASY_N_JOBS 做进程并行)传总核数, 拟合方法侧按"全核/折数"自动分配。
+export PHEASY_N_JOBS="${NJOBS:-$NCPU}"
 export PHEASY_SM_DTYPE="$SM_DTYPE"
 if [ "$LASSO_SPARSE" = "1" ] || [ "$LASSO_SPARSE" = "true" ]; then
   export PHEASY_LASSO_SPARSE=1
