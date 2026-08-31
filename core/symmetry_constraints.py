@@ -333,7 +333,74 @@ class SymmetryConstraints(object):
                                 ns = ns[:, col_norms > eps]
                     return ns
 
-                if _use_combined and len(cons_asr) > 1:
+                def _eliminate_row(ns, b_row, eps):
+                    """Eliminate ONE constraint row from ns via column pivoting.
+
+                    Drops the pivot column and zeroes the constraint on the
+                    remaining basis, so b_row @ ns_new == 0 (up to eps). Keeps ns
+                    sparse CSC. This is the dimension-reducing replacement for the
+                    wide-B projection: the wide-B path only projected (kept all
+                    columns, densified), which for n_free >> m_b left a rank-deficient
+                    over-complete basis and blew up nnz / wall time.
+                    """
+                    n_free = ns.shape[1]
+                    if n_free <= 1:
+                        return ns
+                    b = _np.asarray(b_row.toarray()).ravel()  # (n_free,) dense
+                    nz = _np.nonzero(b)[0]
+                    if nz.size == 0:
+                        return ns  # constraint already satisfied
+                    # partial pivoting: largest |b| as pivot for stability
+                    pidx = int(nz[_np.argmax(_np.abs(b[nz]))])
+                    pv = b[pidx]
+                    if abs(pv) < eps:
+                        return ns  # numerically satisfied
+                    keep = _np.arange(n_free)
+                    keep = keep[keep != pidx]  # (n_free-1,)
+                    coefs = -b[keep] / pv      # (n_free-1,)
+                    # elimination matrix E: (n_free, n_free-1)
+                    #   E[keep[j], j] = 1   (identity on kept rows)
+                    #   E[pidx, j]    = coefs[j] (pivot-row combination)
+                    _n_keep = keep.size
+                    rows = _np.concatenate([keep, _np.full(_n_keep, pidx)])
+                    cols = _np.concatenate([_np.arange(_n_keep), _np.arange(_n_keep)])
+                    data = _np.concatenate([_np.ones(_n_keep), coefs])
+                    E = _sp.coo_matrix((data, (rows, cols)),
+                                       shape=(n_free, n_free - 1)).tocsr()
+                    ns_new = (ns @ E).tocsc()
+                    if _sparse_thr > 0:
+                        _d = ns_new.data
+                        _d[_np.abs(_d) < _sparse_thr] = 0.0
+                        ns_new.eliminate_zeros()
+                    return ns_new
+
+                _use_eliminate = _os.environ.get("PHEASY_ASR_ELIMINATE", "1") == "1"
+                if _use_eliminate:
+                    # Sparse column elimination: dimension-reducing, sparse-preserving.
+                    # Processes each constraint row independently; dependent rows
+                    # (already satisfied after earlier eliminations) become zero and
+                    # drop no column, so the final column count == n_free - rank(cons).
+                    print(f'[ASR] elimination mode (n_free={_n_free}, '
+                          f'{_total_rows} constraint rows)', flush=True)
+                    import time as _time
+                    _t0 = _time.time()
+                    for _ci, _cm in enumerate(cons_asr):
+                        for _ri in range(_cm.shape[0]):
+                            _row = _cm.getrow(_ri)
+                            _b = _row.dot(ns_mat)
+                            ns_mat = _eliminate_row(ns_mat, _b, self._eps)
+                            if ns_mat.shape[1] == 0:
+                                break
+                        if ns_mat.shape[1] > 0:
+                            ns_mat = normalize(ns_mat, axis=0)
+                        if _ci % 10 == 0 or _ci == len(cons_asr) - 1:
+                            _nnz = ns_mat.nnz if _sp.issparse(ns_mat) else 'dense'
+                            print(f'[ASR]   cons {_ci+1}/{len(cons_asr)}: '
+                                  f'n_free={ns_mat.shape[1]}, nnz={_nnz}, '
+                                  f't={_time.time()-_t0:.1f}s', flush=True)
+                        if ns_mat.shape[1] == 0:
+                            break
+                elif _use_combined and len(cons_asr) > 1:
                     # Adaptive chunked SVD: split constraints so each chunk's
                     # lwork ~ 2 * chunk_rows * n_free stays under INT32_MAX.
                     # PHEASY_ASR_LWORK_LIMIT: override (default INT32_MAX)
