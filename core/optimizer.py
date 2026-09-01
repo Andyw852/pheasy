@@ -731,7 +731,12 @@ def _ridge_solve(A, y, alpha, x0=None):
             y_aug = np.concatenate([y64, np.zeros(n)])
         else:
             op, y_aug = A, y64
-        _eps = np.finfo(np.dtype(getattr(op, "dtype", np.float64))).eps
+        # [FIX] dtype from the DATA-carrying operator A, not the wrapper
+        # shell: augmented/masked/sliced LinearOperator shells declare dtype
+        # = the OUTPUT array type (often float64), not the computation
+        # precision (A may be float32 TwoLevelSM) -- shell dtype would give
+        # an unreachable strict tolerance (LSMR always hits maxiter).
+        _eps = np.finfo(np.dtype(getattr(A, "dtype", np.float64))).eps
         _dflt = "1e-8" if _eps < 1e-10 else "1e-6"
         atol = float(os.environ.get("PHEASY_LSQR_ATOL", _dflt))
         btol = float(os.environ.get("PHEASY_LSQR_BTOL", _dflt))
@@ -764,7 +769,12 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
         op_base = _make_masked_op(A, row_idx, col_idx)
         op = op_base          # no ridge: solve the masked operator directly
         n = len(col_idx)
-        _eps = np.finfo(np.dtype(getattr(op, "dtype", np.float64))).eps
+        # [FIX] dtype from the DATA-carrying operator A, not the wrapper
+        # shell: augmented/masked/sliced LinearOperator shells declare dtype
+        # = the OUTPUT array type (often float64), not the computation
+        # precision (A may be float32 TwoLevelSM) -- shell dtype would give
+        # an unreachable strict tolerance (LSMR always hits maxiter).
+        _eps = np.finfo(np.dtype(getattr(A, "dtype", np.float64))).eps
         _dflt = "1e-8" if _eps < 1e-10 else "1e-6"
         atol = float(os.environ.get("PHEASY_LSQR_ATOL", str(
             lsmr_atol if lsmr_atol is not None else _dflt)))
