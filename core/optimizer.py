@@ -2038,17 +2038,34 @@ class Optimizer(object):
         self._results = {}
         self._metrics = {}
 
-    def _ols_lsmr(self, X, y, atol=1e-8, btol=1e-8, maxiter=5000):
-        """OLS via LSMR (iterative; sparse and LinearOperator safe)."""
-        atol = float(os.environ.get("PHEASY_OLS_ATOL", str(atol)))
-        btol = float(os.environ.get("PHEASY_OLS_BTOL", str(btol)))
-        maxiter = int(os.environ.get("PHEASY_OLS_MAXITER", str(maxiter)))
+    def _ols_lsmr(self, X, y, atol=None, btol=None, maxiter=None):
+        """OLS via LSMR (iterative; sparse and LinearOperator safe).
+
+        [FIX] tolerance must follow operator dtype: float32 (eps ~1.2e-7)
+        cannot converge to atol=1e-8 (unreachable -> LSMR always hits
+        maxiter). Defaults: 1e-8 for float64, 1e-6 for float32, from the
+        DATA-carrying operator X. show=PHEASY_LSQR_SHOW prints the per-iter
+        LS column (the real stopping criterion). PHEASY_LSQR_MAXITER caps
+        iterations like the LSQR path (probe runs set it to 200).
+        """
+        _eps = np.finfo(np.dtype(getattr(X, "dtype", np.float64))).eps
+        _dflt = "1e-8" if _eps < 1e-10 else "1e-6"
+        atol = float(os.environ.get("PHEASY_OLS_ATOL",
+                                    os.environ.get("PHEASY_LSQR_ATOL", _dflt)))
+        btol = float(os.environ.get("PHEASY_OLS_BTOL",
+                                    os.environ.get("PHEASY_LSQR_BTOL", _dflt)))
+        maxiter = int(os.environ.get("PHEASY_OLS_MAXITER",
+                                     os.environ.get("PHEASY_LSQR_MAXITER", "5000")))
         ridge = float(os.environ.get("PHEASY_OLS_RIDGE", "0"))
         n_samples = X.shape[0]
         damp = float(np.sqrt(ridge * n_samples)) if ridge > 0 else 0.0
         y_in = np.asarray(y, dtype=np.float64).ravel()
-        result = _lsmr(X, y_in, damp=damp, atol=atol, btol=btol, maxiter=maxiter)
+        _show = (os.environ.get("PHEASY_LSQR_SHOW", "0") == "1")
+        result = _lsmr(X, y_in, damp=damp, atol=atol, btol=btol,
+                       maxiter=maxiter, show=_show)
         coef = np.asarray(result[0], dtype=np.float64)
+        print("[LSMR] istop={} itn={} normr={:.3e} (atol={:.0e}, lim={})".format(
+            result[1], result[2], result[3], atol, maxiter), flush=True)
         self._ols_lsmr_info = {"istop": result[1], "itn": result[2],
                                "normr": result[3], "normar": result[4]}
         return coef
