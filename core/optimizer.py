@@ -66,6 +66,9 @@ def _resolve_n_jobs(method=None, default=-1):
     return max(1, min(n if n > 0 else n_cpu, n_cpu))
 
 
+_BLAS_WARNED = False  # one-time no-threadpoolctl warning
+
+
 @contextlib.contextmanager
 def _blas_limit(n_outer):
     """Cap each worker's BLAS threads when the OUTER loop already runs n_outer.
@@ -85,6 +88,11 @@ def _blas_limit(n_outer):
     except ImportError:
         threadpool_limits = None
     if threadpool_limits is None:
+        global _BLAS_WARNED
+        if not _BLAS_WARNED:
+            print("[BLAS] threadpoolctl 缺失: 内外层线程不再协调, "
+                  "外层 %d 折 x 内层满核可能超订" % n_outer, flush=True)
+            _BLAS_WARNED = True
         yield
     else:
         with threadpool_limits(limits=per):

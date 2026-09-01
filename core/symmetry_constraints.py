@@ -421,14 +421,30 @@ class SymmetryConstraints(object):
                     # [B3] post-elimination verification. max|C@ns| is the
                     # acceptance criterion (should be ~1e-10); eliminated+skipped
                     # must equal total_rows unless the loop early-broke at 0 cols.
+                    # The |pivot|<eps skip heuristic uses an ABSOLUTE threshold
+                    # (not scale-invariant), so a genuinely independent row could
+                    # be misjudged "satisfied" and skipped -> the null space then
+                    # VIOLATES the constraints while the fit silently proceeds.
+                    # PHEASY_ASR_VERIFY=1 (default) turns max|C@ns| into a hard
+                    # gate; PHEASY_ASR_VERIFY_TOL (default 1e-8) is 7 decades
+                    # above the ~1e-15 normal value. Set VERIFY=0 only if the
+                    # check itself becomes a bottleneck (it is the guard).
+                    _verify = _os.environ.get("PHEASY_ASR_VERIFY", "1") == "1"
+                    _vtol = float(_os.environ.get("PHEASY_ASR_VERIFY_TOL", "1e-8"))
                     _res = 0.0
-                    if ns_mat.shape[1] > 0:
+                    if _verify and ns_mat.shape[1] > 0:
                         for _cm in cons_asr:
                             if _cm.shape[0] > 0:
                                 _res = max(_res, float(abs(_cm.dot(ns_mat)).max()))
                     print(f'[ASR] done: n_free={ns_mat.shape[1]}, '
                           f'eliminated={_eliminated}, skipped={_skipped}, '
                           f'max|C@ns|={_res:.2e}', flush=True)
+                    if _verify and _res > _vtol:
+                        raise RuntimeError(
+                            "[ASR] null space violates constraints: max|C@ns|="
+                            "%.2e > %.0e; the |pivot|<eps skip heuristic dropped "
+                            "a genuinely independent row. Tighten --eps or set "
+                            "PHEASY_ASR_ELIMINATE=0." % (_res, _vtol))
                     if _eliminated + _skipped != _total_rows:
                         print(f'[ASR] WARNING: eliminated+skipped='
                               f'{_eliminated + _skipped} != total_rows={_total_rows} '
