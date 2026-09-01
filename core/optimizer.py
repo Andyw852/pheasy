@@ -222,7 +222,8 @@ def _solve_sparse_lsqr(A, y):
     btol = float(os.environ.get("PHEASY_LSQR_BTOL", _dflt))
     iter_lim = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
     y64 = np.asarray(y, dtype=np.float64).ravel()
-    res = _sp_lsqr(A, y64, atol=atol, btol=btol, iter_lim=iter_lim)
+    res = _sp_lsqr(A, y64, atol=atol, btol=btol, iter_lim=iter_lim,
+                   show=(os.environ.get("PHEASY_LSQR_SHOW", "0") == "1"))
     print("[LSQR] istop={} itn={} r1norm={:.3e} (atol={:.0e}, lim={})".format(
         res[1], res[2], res[3], atol, iter_lim), flush=True)
     return np.asarray(res[0], dtype=np.float64)
@@ -904,41 +905,49 @@ class TwoLevelSM(LinearOperator):
         self._matvec_nthr = min(
             int(os.environ.get("PHEASY_SM_MATVEC_THREADS", "32")),
             max(1, _avail_cores()))
+        # [FIX] slice SM_prime into row blocks ONCE here (slicing a CSR is
+        # a COPY, ~one 45GB copy per matvec if done inside _sm_matvec --
+        # 8.3x the matvec cost). Store blocks as DIRECT attributes (a
+        # TwoLevelSM constructor would copy them again).
+        n = SM_prime.shape[0]
+        if self._matvec_nthr <= 1 or n < 10000:
+            self._blocks = None
+            self._blk = n
+        else:
+            self._blk = int(np.ceil(n / self._matvec_nthr))
+            self._blocks = [SM_prime[i * self._blk:min(i * self._blk + self._blk, n)]
+                            for i in range(self._matvec_nthr)]
         super().__init__(np.dtype(dt), (SM_prime.shape[0], NS.shape[1]))
 
     def _sm_matvec(self, x):
-        """Row-blocked threaded SM_prime @ x. scipy sparse matvec releases
-        the GIL (verified: 8 threads ~4.5x on the 45GB CSR), so threads scale
-        to memory bandwidth and saturate ~16-32 threads. Override with
-        PHEASY_SM_MATVEC_THREADS (default 32, capped at avail cores)."""
-        if self._matvec_nthr <= 1 or self.SM_prime.shape[0] < 10000:
+        """Row-blocked threaded SM_prime @ x (blocks pre-sliced in __init__)."""
+        if self._blocks is None:
             return self.SM_prime @ x
-        n = self.SM_prime.shape[0]
-        blk = int(np.ceil(n / self._matvec_nthr))
         out = [None] * self._matvec_nthr
         def _do(i):
-            r0 = i * blk
-            out[i] = self.SM_prime[r0:min(r0 + blk, n)] @ x
+            out[i] = self._blocks[i] @ x
         th = [threading.Thread(target=_do, args=(i,)) for i in range(self._matvec_nthr)]
         for t in th: t.start()
         for t in th: t.join()
         return np.concatenate(out)
 
     def _sm_rmatvec(self, y):
-        """Row-blocked threaded SM_prime.T @ y (sum of per-block column sums)."""
-        if self._matvec_nthr <= 1 or self.SM_prime.shape[0] < 10000:
+        """Row-blocked threaded SM_prime.T @ y; float64 cross-block sum (a
+        float32 sum floors at ~1e-5 and would make atol=1e-6 unreachable)."""
+        if self._blocks is None:
             return self.SM_prime.T @ y
-        n = self.SM_prime.shape[0]
-        blk = int(np.ceil(n / self._matvec_nthr))
         out = [None] * self._matvec_nthr
         def _do(i):
-            r0 = i * blk
-            r1 = min(r0 + blk, n)
-            out[i] = self.SM_prime[r0:r1].T @ y[r0:r1]
+            r0 = i * self._blk
+            r1 = min(r0 + self._blk, self.SM_prime.shape[0])
+            out[i] = self._blocks[i].T @ y[r0:r1]
         th = [threading.Thread(target=_do, args=(i,)) for i in range(self._matvec_nthr)]
         for t in th: t.start()
         for t in th: t.join()
-        return np.sum(np.stack(out), axis=0)
+        acc = np.zeros(self.SM_prime.shape[1], dtype=np.float64)
+        for b in out:
+            acc += np.asarray(b, dtype=np.float64)
+        return acc
 
     def _matvec(self, v):
         v = np.ascontiguousarray(v, dtype=self._dt)

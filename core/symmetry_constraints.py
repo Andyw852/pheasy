@@ -436,9 +436,10 @@ class SymmetryConstraints(object):
                         for _cm in cons_asr:
                             if _cm.shape[0] > 0:
                                 _res = max(_res, float(abs(_cm.dot(ns_mat)).max()))
+                    _res_str = f'{_res:.2e}' if _verify else 'skipped (PHEASY_ASR_VERIFY=0)'
                     print(f'[ASR] done: n_free={ns_mat.shape[1]}, '
                           f'eliminated={_eliminated}, skipped={_skipped}, '
-                          f'max|C@ns|={_res:.2e}', flush=True)
+                          f'max|C@ns|={_res_str}', flush=True)
                     if _verify and _res > _vtol:
                         raise RuntimeError(
                             "[ASR] null space violates constraints: max|C@ns|="
