@@ -205,11 +205,17 @@ def _solve_sparse_lsqr(A, y):
     ~280 GB). This is the same Krylov approach used by symfc / phonopy.
     """
     from scipy.sparse.linalg import lsqr as _sp_lsqr
-    atol = float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8"))
-    btol = float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8"))
+    # [FIX] tolerance must follow operator dtype: float32 (eps ~1.2e-7)
+    # cannot converge to atol=1e-8 (unreachable -> LSQR always hits iter_lim).
+    _eps = np.finfo(np.dtype(getattr(A, "dtype", np.float64))).eps
+    _dflt = "1e-8" if _eps < 1e-10 else "1e-6"
+    atol = float(os.environ.get("PHEASY_LSQR_ATOL", _dflt))
+    btol = float(os.environ.get("PHEASY_LSQR_BTOL", _dflt))
     iter_lim = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
     y64 = np.asarray(y, dtype=np.float64).ravel()
     res = _sp_lsqr(A, y64, atol=atol, btol=btol, iter_lim=iter_lim)
+    print("[LSQR] istop={} itn={} r1norm={:.3e} (atol={:.0e}, lim={})".format(
+        res[1], res[2], res[3], atol, iter_lim), flush=True)
     return np.asarray(res[0], dtype=np.float64)
 
 
@@ -725,10 +731,14 @@ def _ridge_solve(A, y, alpha, x0=None):
             y_aug = np.concatenate([y64, np.zeros(n)])
         else:
             op, y_aug = A, y64
-        atol = float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8"))
-        btol = float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8"))
+        _eps = np.finfo(np.dtype(getattr(op, "dtype", np.float64))).eps
+        _dflt = "1e-8" if _eps < 1e-10 else "1e-6"
+        atol = float(os.environ.get("PHEASY_LSQR_ATOL", _dflt))
+        btol = float(os.environ.get("PHEASY_LSQR_BTOL", _dflt))
         maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
         res = _lsmr(op, y_aug, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
+        print("[LSMR] istop={} itn={} r1norm={:.3e} (atol={:.0e}, lim={})".format(
+            res[1], res[2], res[3], atol, maxiter), flush=True)
         return np.asarray(res[0], dtype=np.float64)
     if alpha > 0:
         ridge = Ridge(alpha=alpha, fit_intercept=False, solver="auto")
@@ -754,10 +764,12 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
         op_base = _make_masked_op(A, row_idx, col_idx)
         op = op_base          # no ridge: solve the masked operator directly
         n = len(col_idx)
+        _eps = np.finfo(np.dtype(getattr(op, "dtype", np.float64))).eps
+        _dflt = "1e-8" if _eps < 1e-10 else "1e-6"
         atol = float(os.environ.get("PHEASY_LSQR_ATOL", str(
-            lsmr_atol if lsmr_atol is not None else 1e-8)))
+            lsmr_atol if lsmr_atol is not None else _dflt)))
         btol = float(os.environ.get("PHEASY_LSQR_BTOL", str(
-            lsmr_btol if lsmr_btol is not None else 1e-8)))
+            lsmr_btol if lsmr_btol is not None else _dflt)))
         maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", str(
             lsmr_maxiter if lsmr_maxiter is not None else 5000)))
         if ridge_alpha > 0:
@@ -777,6 +789,8 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
                                 rmatvec=rmv_aug, dtype=np.float64)
             y_sub = np.concatenate([y_sub, np.zeros(n)])
         res = _lsmr(op, y_sub, atol=atol, btol=btol, maxiter=maxiter)
+        print("[LSMR] istop={} itn={} r1norm={:.3e} (atol={:.0e}, lim={})".format(
+            res[1], res[2], res[3], atol, maxiter), flush=True)
         return np.asarray(res[0], dtype=np.float64)
 
     A_sub = A[:, col_idx]
