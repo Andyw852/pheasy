@@ -905,22 +905,38 @@ class TwoLevelSM(LinearOperator):
         self._matvec_nthr = min(
             int(os.environ.get("PHEASY_SM_MATVEC_THREADS", "32")),
             max(1, _avail_cores()))
-        # [FIX] slice SM_prime into row blocks ONCE here (slicing a CSR is
-        # a COPY, ~one 45GB copy per matvec if done inside _sm_matvec --
-        # 8.3x the matvec cost). Store blocks as DIRECT attributes (a
-        # TwoLevelSM constructor would copy them again).
+        # [FIX] TRUE zero-copy row blocks: CSR slicing is a COPY (45GB per
+        # slice; slicing inside matvec was 8.3x the matvec cost). Hand-
+        # assemble each block so data/indices are numpy VIEWS sharing memory
+        # with SM_prime (verified shares_memory=True); only indptr (MBs) is
+        # new. NOTE: assign attrs directly -- passing arrays to the csr
+        # constructor would copy them (the constructor copies anything it is
+        # given). Also pre-transpose to CSC once: csr.T is ANOTHER O(nnz)
+        # copy per call (csc data is reordered), so doing b.T inside
+        # _sm_rmatvec would pay a 45GB transpose EVERY iteration.
         n = SM_prime.shape[0]
-        if self._matvec_nthr <= 1 or n < 10000:
-            self._blocks = None
-            self._blk = n
-        else:
+        self._blocks = None
+        self._blocksT = None
+        self._blk = n
+        if self._matvec_nthr > 1 and n >= 10000:
             self._blk = int(np.ceil(n / self._matvec_nthr))
-            self._blocks = [SM_prime[i * self._blk:min(i * self._blk + self._blk, n)]
-                            for i in range(self._matvec_nthr)]
+            self._blocks = []
+            for i in range(self._matvec_nthr):
+                r0 = i * self._blk
+                r1 = min(r0 + self._blk, n)
+                p0, p1 = SM_prime.indptr[r0], SM_prime.indptr[r1]
+                b = sp.csr_matrix((1, 1), dtype=SM_prime.dtype)  # empty shell
+                b.data = SM_prime.data[p0:p1]        # numpy VIEW, no copy
+                b.indices = SM_prime.indices[p0:p1]  # numpy VIEW, no copy
+                b.indptr = (SM_prime.indptr[r0:r1 + 1] - p0).astype(SM_prime.indptr.dtype)
+                b._shape = (r1 - r0, SM_prime.shape[1])
+                self._blocks.append(b)
+            # CSC transpose once (construction-time cost only).
+            self._blocksT = [b.T for b in self._blocks]
         super().__init__(np.dtype(dt), (SM_prime.shape[0], NS.shape[1]))
 
     def _sm_matvec(self, x):
-        """Row-blocked threaded SM_prime @ x (blocks pre-sliced in __init__)."""
+        """Row-blocked threaded SM_prime @ x (blocks are zero-copy views)."""
         if self._blocks is None:
             return self.SM_prime @ x
         out = [None] * self._matvec_nthr
@@ -932,22 +948,24 @@ class TwoLevelSM(LinearOperator):
         return np.concatenate(out)
 
     def _sm_rmatvec(self, y):
-        """Row-blocked threaded SM_prime.T @ y; float64 cross-block sum (a
-        float32 sum floors at ~1e-5 and would make atol=1e-6 unreachable)."""
-        if self._blocks is None:
+        """Row-blocked threaded SM_prime.T @ y on pre-transposed CSC blocks;
+        float64 cross-block sum (a float32 sum floors at ~1e-5 and would make
+        atol=1e-6 unreachable), then cast back to the operator dtype so
+        matvec and rmatvec outputs agree with the declared A.dtype (BUG3)."""
+        if self._blocksT is None:
             return self.SM_prime.T @ y
         out = [None] * self._matvec_nthr
         def _do(i):
             r0 = i * self._blk
             r1 = min(r0 + self._blk, self.SM_prime.shape[0])
-            out[i] = self._blocks[i].T @ y[r0:r1]
+            out[i] = self._blocksT[i] @ y[r0:r1]
         th = [threading.Thread(target=_do, args=(i,)) for i in range(self._matvec_nthr)]
         for t in th: t.start()
         for t in th: t.join()
         acc = np.zeros(self.SM_prime.shape[1], dtype=np.float64)
         for b in out:
             acc += np.asarray(b, dtype=np.float64)
-        return acc
+        return np.ascontiguousarray(acc, dtype=self._dt)
 
     def _matvec(self, v):
         v = np.ascontiguousarray(v, dtype=self._dt)
