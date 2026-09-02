@@ -993,7 +993,6 @@ class TwoLevelSM(LinearOperator):
         # (BUG1), not the transpose.
         n = SM_prime.shape[0]
         self._blocks = None
-        self._blocksT = None
         self._blk = n
         if self._matvec_nthr > 1 and n >= 10000:
             self._blk = int(np.ceil(n / self._matvec_nthr))
@@ -1008,8 +1007,12 @@ class TwoLevelSM(LinearOperator):
                 b.indptr = (SM_prime.indptr[r0:r1 + 1] - p0).astype(SM_prime.indptr.dtype)
                 b._shape = (r1 - r0, SM_prime.shape[1])
                 self._blocks.append(b)
-            # CSC transpose once (construction-time cost only).
-            self._blocksT = [b.T for b in self._blocks]
+        # NO _blocksT: a CSC transpose of the view blocks would copy the
+        # full nnz (45GB) -- SM_prime 45GB + that + NS + work arrays
+        # overflowed even a 96G request (observed OOM at 94GB MaxRSS).
+        # rmatvec instead left-multiplies each CSR block (y @ b, zero
+        # copy, no transpose); measured GIL release ~1.8x@8thr (vs 3.4x
+        # for CSC) but halves peak memory so the fit fits a 255GB node.
         super().__init__(np.dtype(dt), (SM_prime.shape[0], NS.shape[1]))
 
     def _sm_matvec(self, x):
@@ -1025,17 +1028,18 @@ class TwoLevelSM(LinearOperator):
         return np.concatenate(out)
 
     def _sm_rmatvec(self, y):
-        """Row-blocked threaded SM_prime.T @ y on pre-transposed CSC blocks;
-        float64 cross-block sum (a float32 sum floors at ~1e-5 and would make
-        atol=1e-6 unreachable), then cast back to the operator dtype so
-        matvec and rmatvec outputs agree with the declared A.dtype (BUG3)."""
-        if self._blocksT is None:
+        """Row-blocked threaded SM_prime.T @ y via left-multiply per block
+        (y[r0:r1] @ blocks[i] -- zero copy, NO CSC transpose, so no 45GB
+        _blocksT buffer). float64 cross-block sum (a float32 sum floors at
+        ~1e-5 and would make atol=1e-6 unreachable), then cast back to the
+        operator dtype so matvec/rmatvec agree with A.dtype (BUG3)."""
+        if self._blocks is None:
             return self.SM_prime.T @ y
         out = [None] * self._matvec_nthr
         def _do(i):
             r0 = i * self._blk
             r1 = min(r0 + self._blk, self.SM_prime.shape[0])
-            out[i] = self._blocksT[i] @ y[r0:r1]
+            out[i] = y[r0:r1] @ self._blocks[i]
         th = [threading.Thread(target=_do, args=(i,)) for i in range(self._matvec_nthr)]
         for t in th: t.start()
         for t in th: t.join()
