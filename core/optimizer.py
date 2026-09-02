@@ -206,6 +206,57 @@ def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
     return list(kf.split(np.arange(n_samples)))
 
 
+def _jacobi_col_scale(A, mode="free", n_rand=20, seed=0):
+    """Jacobi (diagonal) column scale d for A, so that solving on
+    A_d = A @ diag(1/d) (then x = D^-1 z) is a preconditioned LSQR/LSMR
+    with the SAME solution but better conditioning: LSQR/LSMR convergence
+    is governed by cond(A), and un-scaled columns (pheasy_fit.sh notes
+    column norms span ~1e2) inflate it. OLS was never in the standardize
+    list (Optimizer.fit only scales LASSO/ALASSO/RIDGE), so iterative OLS
+    runs on raw column scale.
+
+    modes:
+      "free" - d_j = ||NS[:, j]|| for TwoLevelSM (A = SM_prime @ NS).
+               Zero matvecs: one pass over the sparse NS nnz. Rough (does
+               not fold in SM_prime row weights) but directionally right
+               and free.
+      "rand" - E over Rademacher z of z * (A^T (A z)) = diag(A^T A);
+               ~2*n_rand matvecs (default 20 -> 40 matvecs). Accurate
+               column norm estimate for any operator.
+    Returns float64 d (p,) or None (no scaling available).
+    """
+    ns = getattr(A, "NS", None)
+    if mode == "free" and ns is not None and sp.issparse(ns):
+        sq = np.asarray(ns.multiply(ns).sum(axis=0)).ravel()
+        d = np.sqrt(np.maximum(sq, 0.0)).astype(np.float64)
+        return np.where(d > 1e-30, d, 1.0)
+    if mode == "rand":
+        rng = np.random.default_rng(seed)
+        p = A.shape[1]
+        acc = np.zeros(p, dtype=np.float64)
+        for _ in range(max(1, int(n_rand))):
+            z = rng.choice([-1.0, 1.0], size=p).astype(A.dtype)
+            acc += np.asarray(z).astype(np.float64) * np.asarray(
+                A.rmatvec(np.asarray(A.matvec(z)))).ravel()
+        d = np.sqrt(np.maximum(acc / max(1, int(n_rand)), 0.0))
+        return np.where(d > 1e-30, d, 1.0)
+    return None
+
+
+def _jacobi_wrapped(A, d):
+    """LinearOperator for A_d = A @ diag(1/d) with x-space scaling z=D x.
+    A_d.matvec(v) = A.matvec(v / d); A_d.rmatvec(u) = A.rmatvec(u) / d.
+    """
+    from scipy.sparse.linalg import LinearOperator
+    def mv(v):
+        v = np.asarray(v, dtype=np.float64)
+        return A.matvec(v / d)
+    def rmv(u):
+        u = np.asarray(u, dtype=np.float64)
+        return np.asarray(A.rmatvec(u), dtype=np.float64) / d
+    return LinearOperator(A.shape, dtype=np.float64, matvec=mv, rmatvec=rmv)
+
+
 def _solve_sparse_lsqr(A, y):
     """Iterative least squares (LSQR) for sparse / LinearOperator input.
 
@@ -222,11 +273,26 @@ def _solve_sparse_lsqr(A, y):
     btol = float(os.environ.get("PHEASY_LSQR_BTOL", _dflt))
     iter_lim = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
     y64 = np.asarray(y, dtype=np.float64).ravel()
+    # [FIX] Jacobi preconditioning: OLS was never column-scaled, and
+    # un-scaled columns (norm span ~1e2) inflate cond(A) and slow LSQR.
+    # PHEASY_LSQR_PRECOND=free|rand wraps A with A@diag(1/d) (same
+    # solution, x = z / d). free = ||NS[:,j]|| (zero matvecs); rand =
+    # ~40 matvec Rademacher estimate.
+    _pc = os.environ.get("PHEASY_LSQR_PRECOND", "0").strip().lower()
+    _d = None
+    if _pc in ("free", "rand"):
+        _d = _jacobi_col_scale(A, mode=_pc)
+    if _d is not None:
+        A = _jacobi_wrapped(A, _d)
     res = _sp_lsqr(A, y64, atol=atol, btol=btol, iter_lim=iter_lim,
                    show=(os.environ.get("PHEASY_LSQR_SHOW", "0") == "1"))
-    print("[LSQR] istop={} itn={} r1norm={:.3e} (atol={:.0e}, lim={})".format(
-        res[1], res[2], res[3], atol, iter_lim), flush=True)
-    return np.asarray(res[0], dtype=np.float64)
+    x = np.asarray(res[0], dtype=np.float64)
+    if _d is not None:
+        x = x / _d
+    print("[LSQR] istop={} itn={} r1norm={:.3e} (atol={:.0e}, lim={}, precond={})".format(
+        res[1], res[2], res[3], atol, iter_lim, _pc if _d is not None else "off"),
+        flush=True)
+    return x
 
 
 def _available_memory_bytes():
@@ -911,9 +977,20 @@ class TwoLevelSM(LinearOperator):
         # with SM_prime (verified shares_memory=True); only indptr (MBs) is
         # new. NOTE: assign attrs directly -- passing arrays to the csr
         # constructor would copy them (the constructor copies anything it is
-        # given). Also pre-transpose to CSC once: csr.T is ANOTHER O(nnz)
-        # copy per call (csc data is reordered), so doing b.T inside
-        # _sm_rmatvec would pay a 45GB transpose EVERY iteration.
+        # given).
+        #
+        # NOTE on the CSC transpose (corrected attribution): for a matrix
+        # scipy itself built, A.T is ZERO-cost -- transpose() only re-wraps
+        # the same data/indices/indptr under a csc_matrix shell (verified:
+        # A.T.data shares_memory with A.data, ~10us per .T, vs 10ms per
+        # matvec). The O(nnz) copy only happens for matrices scipy does NOT
+        # own the data of -- our hand-assembled view blocks (b.data is a
+        # numpy view of SM_prime.data, so scipy csc re-wrapping copies it).
+        # Hence we still pre-transpose to CSC once at construction; but do
+        # NOT treat "csr.T per call" as a 45GB/iter cost in general.
+        #
+        # The earlier 8.3x matvec slowdown was entirely the CSR SLICING
+        # (BUG1), not the transpose.
         n = SM_prime.shape[0]
         self._blocks = None
         self._blocksT = None
@@ -2079,11 +2156,54 @@ class Optimizer(object):
         damp = float(np.sqrt(ridge * n_samples)) if ridge > 0 else 0.0
         y_in = np.asarray(y, dtype=np.float64).ravel()
         _show = (os.environ.get("PHEASY_LSQR_SHOW", "0") == "1")
-        result = _lsmr(X, y_in, damp=damp, atol=atol, btol=btol,
-                       maxiter=maxiter, show=_show)
-        coef = np.asarray(result[0], dtype=np.float64)
-        print("[LSMR] istop={} itn={} normr={:.3e} (atol={:.0e}, lim={})".format(
-            result[1], result[2], result[3], atol, maxiter), flush=True)
+        # [FIX] Jacobi preconditioning for OLS (see _solve_sparse_lsqr):
+        # PHEASY_LSQR_PRECOND=free|rand scales columns so cond(A) drops;
+        # same solution via x = z / d. Also PHEASY_LSMR_CHECKPOINTS=
+        # "1000,2000,3000" saves x at those iteration counts (segmented
+        # x0-restart LSMR) so fc2 convergence can be compared across runs
+        # instead of trusting LS<=atol alone.
+        _pc = os.environ.get("PHEASY_LSQR_PRECOND", "0").strip().lower()
+        _d = None
+        if _pc in ("free", "rand"):
+            _d = _jacobi_col_scale(X, mode=_pc)
+        Xop = X
+        if _d is not None:
+            Xop = _jacobi_wrapped(X, _d)
+        _cks = [int(t) for t in str(os.environ.get("PHEASY_LSMR_CHECKPOINTS", "")).split(",") if t.strip().isdigit()]
+        _segs = sorted(t for t in _cks if 0 < t < maxiter)
+        _x0 = None
+        _ck_saved = []
+        _res_last = None
+        if _segs:
+            # segmented x0-restart LSMR: each segment runs on the previous
+            # solution as x0 (Krylov restart, fine for fc2 stability checks)
+            _bounds = [0] + _segs + [maxiter]
+            for _a, _b in zip(_bounds[:-1], _bounds[1:]):
+                if _b <= _a:
+                    continue
+                _r = _lsmr(Xop, y_in, damp=damp, atol=atol, btol=btol,
+                           maxiter=_b - _a, x0=_x0, show=_show and _b == maxiter)
+                _x0 = np.asarray(_r[0], dtype=np.float64)
+                if _d is not None:
+                    _x0 = _x0 / _d
+                _res_last = _r
+                if _b in _segs:
+                    _ck_saved.append(_b)
+                    np.savez_compressed("lsmr_ck_%d.npz" % _b, x=_x0)
+                    print("[LSMR-ck] saved x@itn=%d (norm=%.4e)" % (_b, float(np.linalg.norm(_x0))),
+                          flush=True)
+            coef = _x0
+            result = _res_last
+        else:
+            result = _lsmr(Xop, y_in, damp=damp, atol=atol, btol=btol,
+                           maxiter=maxiter, show=_show)
+            coef = np.asarray(result[0], dtype=np.float64)
+            if _d is not None:
+                coef = coef / _d
+        print("[LSMR] istop={} itn={} normr={:.3e} (atol={:.0e}, lim={}, precond={}, ck={})".format(
+            result[1], result[2], result[3], atol, maxiter,
+            _pc if _d is not None else "off", ",".join(map(str, _ck_saved)) or "-"),
+            flush=True)
         self._ols_lsmr_info = {"istop": result[1], "itn": result[2],
                                "normr": result[3], "normar": result[4]}
         return coef
