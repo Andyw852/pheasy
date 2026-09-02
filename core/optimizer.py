@@ -2200,11 +2200,14 @@ class Optimizer(object):
             coef = np.asarray(result[0], dtype=np.float64)
             if _d is not None:
                 coef = coef / _d
-        print("[LSMR] istop={} itn={} normr={:.3e} (atol={:.0e}, lim={}, precond={}, ck={})".format(
-            result[1], result[2], result[3], atol, maxiter,
+        # report CUMULATIVE iteration count: each segment restarts LSMR
+        # from the previous solution, so result[2] is per-segment iters.
+        _cum_itn = maxiter if _segs else int(result[2])
+        print("[LSMR] istop={} itn={}(cum) normr={:.3e} (atol={:.0e}, lim={}, precond={}, ck={})".format(
+            result[1], _cum_itn, result[3], atol, maxiter,
             _pc if _d is not None else "off", ",".join(map(str, _ck_saved)) or "-"),
             flush=True)
-        self._ols_lsmr_info = {"istop": result[1], "itn": result[2],
+        self._ols_lsmr_info = {"istop": result[1], "itn": _cum_itn,
                                "normr": result[3], "normar": result[4]}
         return coef
 
