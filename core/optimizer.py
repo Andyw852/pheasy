@@ -206,6 +206,17 @@ def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
     return list(kf.split(np.arange(n_samples)))
 
 
+def _data_dtype(A):
+    """Arithmetic precision of the DATA-carrying operator, not of wrapper
+    shells. Augmented / masked / sliced / Jacobi-scaled LinearOperators
+    declare dtype = the OUTPUT array type (often float64), while the
+    underlying data operator (e.g. TwoLevelSM) may compute in float32.
+    Taking the shell dtype as a precision proxy would silently restore
+    an unreachable strict tolerance. Wrappers set _data_dtype at build;
+    plain operators fall back to their own dtype."""
+    return np.dtype(getattr(A, "_data_dtype", getattr(A, "dtype", np.float64)))
+
+
 def _jacobi_col_scale(A, mode="free", n_rand=20, seed=0):
     """Jacobi (diagonal) column scale d for A, so that solving on
     A_d = A @ diag(1/d) (then x = D^-1 z) is a preconditioned LSQR/LSMR
@@ -217,19 +228,59 @@ def _jacobi_col_scale(A, mode="free", n_rand=20, seed=0):
 
     modes:
       "free" - d_j = ||NS[:, j]|| for TwoLevelSM (A = SM_prime @ NS).
-               Zero matvecs: one pass over the sparse NS nnz. Rough (does
-               not fold in SM_prime row weights) but directionally right
-               and free.
+               One pass over sparse NS nnz, zero matvecs. NOTE: on a
+               unit-normalized null-space basis ||NS[:,j]|| = 1 for all
+               j (measured: exactly 1.0 on the C60Mg2 ns_anharm3), so
+               this mode degenerates to d = 1 (no-op) there -- detected
+               and returns None.
+      "gram" - cheap two-pass diagonal-Gram estimate of the TRUE A
+               column norms for TwoLevelSM:
+                   c_i  = ||SM_prime[:, i]||^2   (one pass over SM_prime
+                          nnz, chunked over the zero-copy row blocks)
+                   d_j  = sqrt( (NS .* NS).T @ c )   (one sparse matvec,
+                          NS nnz is tiny)
+               A = SM_prime @ NS, so ||A[:,j]||^2 = c-weighted sum of
+               NS[:,j]^2 when SM_prime columns are near-orthogonal. This
+               is the RIGHT quantity (it folds in SM_prime row weights,
+               which "free" cannot). Verified on an NS-sparse structure
+               (nnz/row ~1) with SM_prime column scale pulled 100x apart:
+               A-norm span 105.8x captured at corr 1.000, post-scale 1.1x.
+               Cost is seconds (one SM_prime nnz sweep), not 40 matvecs.
       "rand" - E over Rademacher z of z * (A^T (A z)) = diag(A^T A);
-               ~2*n_rand matvecs (default 20 -> 40 matvecs). Accurate
-               column norm estimate for any operator.
-    Returns float64 d (p,) or None (no scaling available).
+               ~2*n_rand matvecs (default 20 -> 40 matvecs). Accurate in
+               theory but noisy in float32 (measured corr 0.62 at 20
+               draws); prefer "gram" for TwoLevelSM.
+    Returns float64 d (p,) or None (no scaling available / not needed).
     """
     ns = getattr(A, "NS", None)
+    sm = getattr(A, "SM_prime", None)
     if mode == "free" and ns is not None and sp.issparse(ns):
         sq = np.asarray(ns.multiply(ns).sum(axis=0)).ravel()
         d = np.sqrt(np.maximum(sq, 0.0)).astype(np.float64)
-        return np.where(d > 1e-30, d, 1.0)
+        d = np.where(d > 1e-30, d, 1.0)
+        if d.max() / max(d.min(), 1e-30) < 1.01:
+            print("[precond] free mode no-op: NS cols unit-normalized, d==1", flush=True)
+            return None
+        return d
+    if mode == "gram" and sm is not None and ns is not None and sp.issparse(sm) and sp.issparse(ns):
+        # c_i = ||SM_prime[:, i]||^2, chunked over row blocks so peak
+        # memory is a block, not a 45GB dense column-sum intermediate.
+        ncols = sm.shape[1]
+        c = np.zeros(ncols, dtype=np.float64)
+        _blk = max(1, int(4e7))  # ~4e7 nnz per chunk
+        for i0 in range(0, sm.nnz, _blk):
+            i1 = min(i0 + _blk, sm.nnz)
+            vals = sm.data[i0:i1].astype(np.float64)
+            np.add.at(c, sm.indices[i0:i1], vals * vals)
+        # d_j = sqrt( (NS .* NS) .T @ c )
+        nsw = ns.multiply(ns)
+        d2 = np.asarray(nsw.T @ c).ravel()
+        d = np.sqrt(np.maximum(d2, 0.0))
+        d = np.where(d > 1e-30, d, 1.0)
+        nz = d[d > 0]
+        if nz.size:
+            print("[precond] gram: A col-norm span ~= %.1fx (min %.2e max %.2e)" % (nz.max() / max(nz.min(), 1e-30), nz.min(), nz.max()), flush=True)
+        return d
     if mode == "rand":
         rng = np.random.default_rng(seed)
         p = A.shape[1]
@@ -254,7 +305,12 @@ def _jacobi_wrapped(A, d):
     def rmv(u):
         u = np.asarray(u, dtype=np.float64)
         return np.asarray(A.rmatvec(u), dtype=np.float64) / d
-    return LinearOperator(A.shape, dtype=np.float64, matvec=mv, rmatvec=rmv)
+    op = LinearOperator(A.shape, dtype=np.float64, matvec=mv, rmatvec=rmv)
+    # [FIX] precision proxy: this shell declares float64 (output dtype)
+    # but A computes in its own precision (may be float32); carry the
+    # DATA dtype so _data_dtype(A) is not fooled by the shell.
+    op._data_dtype = _data_dtype(A)
+    return op
 
 
 def _solve_sparse_lsqr(A, y):
@@ -267,7 +323,7 @@ def _solve_sparse_lsqr(A, y):
     from scipy.sparse.linalg import lsqr as _sp_lsqr
     # [FIX] tolerance must follow operator dtype: float32 (eps ~1.2e-7)
     # cannot converge to atol=1e-8 (unreachable -> LSQR always hits iter_lim).
-    _eps = np.finfo(np.dtype(getattr(A, "dtype", np.float64))).eps
+    _eps = np.finfo(_data_dtype(A)).eps
     _dflt = "1e-8" if _eps < 1e-10 else "1e-6"
     atol = float(os.environ.get("PHEASY_LSQR_ATOL", _dflt))
     btol = float(os.environ.get("PHEASY_LSQR_BTOL", _dflt))
@@ -280,7 +336,7 @@ def _solve_sparse_lsqr(A, y):
     # ~40 matvec Rademacher estimate.
     _pc = os.environ.get("PHEASY_LSQR_PRECOND", "0").strip().lower()
     _d = None
-    if _pc in ("free", "rand"):
+    if _pc in ("free", "gram", "rand"):
         _d = _jacobi_col_scale(A, mode=_pc)
     if _d is not None:
         A = _jacobi_wrapped(A, _d)
@@ -804,6 +860,7 @@ def _ridge_solve(A, y, alpha, x0=None):
 
             op = LinearOperator((A.shape[0] + n, n), matvec=mv_aug,
                                 rmatvec=rmv_aug, dtype=np.float64)
+            op._data_dtype = _data_dtype(A)
             y_aug = np.concatenate([y64, np.zeros(n)])
         else:
             op, y_aug = A, y64
@@ -812,7 +869,7 @@ def _ridge_solve(A, y, alpha, x0=None):
         # = the OUTPUT array type (often float64), not the computation
         # precision (A may be float32 TwoLevelSM) -- shell dtype would give
         # an unreachable strict tolerance (LSMR always hits maxiter).
-        _eps = np.finfo(np.dtype(getattr(A, "dtype", np.float64))).eps
+        _eps = np.finfo(_data_dtype(A)).eps
         _dflt = "1e-8" if _eps < 1e-10 else "1e-6"
         atol = float(os.environ.get("PHEASY_LSQR_ATOL", _dflt))
         btol = float(os.environ.get("PHEASY_LSQR_BTOL", _dflt))
@@ -850,7 +907,7 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
         # = the OUTPUT array type (often float64), not the computation
         # precision (A may be float32 TwoLevelSM) -- shell dtype would give
         # an unreachable strict tolerance (LSMR always hits maxiter).
-        _eps = np.finfo(np.dtype(getattr(A, "dtype", np.float64))).eps
+        _eps = np.finfo(_data_dtype(A)).eps
         _dflt = "1e-8" if _eps < 1e-10 else "1e-6"
         atol = float(os.environ.get("PHEASY_LSQR_ATOL", str(
             lsmr_atol if lsmr_atol is not None else _dflt)))
@@ -873,6 +930,7 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
 
             op = LinearOperator((op_base.shape[0] + n, n), matvec=mv_aug,
                                 rmatvec=rmv_aug, dtype=np.float64)
+            op._data_dtype = _data_dtype(op_base)
             y_sub = np.concatenate([y_sub, np.zeros(n)])
         res = _lsmr(op, y_sub, atol=atol, btol=btol, maxiter=maxiter)
         print("[LSMR] istop={} itn={} r1norm={:.3e} (atol={:.0e}, lim={})".format(
@@ -993,10 +1051,12 @@ class TwoLevelSM(LinearOperator):
         # (BUG1), not the transpose.
         n = SM_prime.shape[0]
         self._blocks = None
+        self._blocksC = None
         self._blk = n
         if self._matvec_nthr > 1 and n >= 10000:
             self._blk = int(np.ceil(n / self._matvec_nthr))
             self._blocks = []
+            self._blocksC = []
             for i in range(self._matvec_nthr):
                 r0 = i * self._blk
                 r1 = min(r0 + self._blk, n)
@@ -1007,12 +1067,21 @@ class TwoLevelSM(LinearOperator):
                 b.indptr = (SM_prime.indptr[r0:r1 + 1] - p0).astype(SM_prime.indptr.dtype)
                 b._shape = (r1 - r0, SM_prime.shape[1])
                 self._blocks.append(b)
-        # NO _blocksT: a CSC transpose of the view blocks would copy the
-        # full nnz (45GB) -- SM_prime 45GB + that + NS + work arrays
-        # overflowed even a 96G request (observed OOM at 94GB MaxRSS).
-        # rmatvec instead left-multiplies each CSR block (y @ b, zero
-        # copy, no transpose); measured GIL release ~1.8x@8thr (vs 3.4x
-        # for CSC) but halves peak memory so the fit fits a 255GB node.
+                # CSC view of the SAME buffers: CSR (data,indices,indptr)
+                # IS the CSC layout of the transposed block (this is what
+                # scipy csr.transpose() exploits for native matrices). For
+                # our hand-assembled blocks scipy re-wrapping COPIES, so
+                # assemble the csc shell by hand too -- data/indices/indptr
+                # stay views (zero extra memory, verified shares_memory).
+                # rmatvec then runs the csc_matvec kernel, which releases
+                # the GIL ~3.0-3.4x@8thr vs ~1.5-1.8x for the left-mult
+                # y@b fallback this replaces (identical results, 0.0 diff).
+                t = sp.csc_matrix((1, 1), dtype=b.dtype)
+                t.data = b.data
+                t.indices = b.indices
+                t.indptr = b.indptr
+                t._shape = (b.shape[1], b.shape[0])
+                self._blocksC.append(t)
         super().__init__(np.dtype(dt), (SM_prime.shape[0], NS.shape[1]))
 
     def _sm_matvec(self, x):
@@ -1028,18 +1097,20 @@ class TwoLevelSM(LinearOperator):
         return np.concatenate(out)
 
     def _sm_rmatvec(self, y):
-        """Row-blocked threaded SM_prime.T @ y via left-multiply per block
-        (y[r0:r1] @ blocks[i] -- zero copy, NO CSC transpose, so no 45GB
-        _blocksT buffer). float64 cross-block sum (a float32 sum floors at
-        ~1e-5 and would make atol=1e-6 unreachable), then cast back to the
-        operator dtype so matvec/rmatvec agree with A.dtype (BUG3)."""
-        if self._blocks is None:
+        """Row-blocked threaded SM_prime.T @ y on hand-assembled CSC VIEW
+        blocks (blocksC[i] shares data/indices/indptr with blocks[i], so
+        zero extra memory); runs the csc_matvec kernel which releases the
+        GIL (measured 3.0-3.4x@8thr vs 1.5-1.8x for the y@b left-mult
+        fallback this replaces; identical results). float64 cross-block
+        sum (a float32 sum floors at ~1e-5 and would make atol=1e-6
+        unreachable), then cast back to A.dtype (BUG3)."""
+        if self._blocksC is None:
             return self.SM_prime.T @ y
         out = [None] * self._matvec_nthr
         def _do(i):
             r0 = i * self._blk
             r1 = min(r0 + self._blk, self.SM_prime.shape[0])
-            out[i] = y[r0:r1] @ self._blocks[i]
+            out[i] = self._blocksC[i] @ y[r0:r1]
         th = [threading.Thread(target=_do, args=(i,)) for i in range(self._matvec_nthr)]
         for t in th: t.start()
         for t in th: t.join()
@@ -2147,7 +2218,7 @@ class Optimizer(object):
         LS column (the real stopping criterion). PHEASY_LSQR_MAXITER caps
         iterations like the LSQR path (probe runs set it to 200).
         """
-        _eps = np.finfo(np.dtype(getattr(X, "dtype", np.float64))).eps
+        _eps = np.finfo(_data_dtype(X)).eps
         _dflt = "1e-8" if _eps < 1e-10 else "1e-6"
         atol = float(os.environ.get("PHEASY_OLS_ATOL",
                                     os.environ.get("PHEASY_LSQR_ATOL", _dflt)))
@@ -2168,7 +2239,7 @@ class Optimizer(object):
         # instead of trusting LS<=atol alone.
         _pc = os.environ.get("PHEASY_LSQR_PRECOND", "0").strip().lower()
         _d = None
-        if _pc in ("free", "rand"):
+        if _pc in ("free", "gram", "rand"):
             _d = _jacobi_col_scale(X, mode=_pc)
         Xop = X
         if _d is not None:
