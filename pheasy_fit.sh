@@ -225,6 +225,21 @@ _fp_hash() {
 _stamp_struct=$(printf 'dim=%s order=%s c2=%s c3=%s c4=%s eps=%s poscar=%s sposcar=%s' \
   "$DIM" "$FIT_ORDER" "$C2_CUTOFF" "$C3_CUTOFF" "$C4_CUTOFF" "$NULL_SPACE_EPS" \
   "$(_fp_hash POSCAR)" "$(_fp_hash SPOSCAR)")
+# 代码版本也进一级指纹：零空间/cluster-space 构造代码（symmetry_constraints.py、
+# cluster_orbit.py）的改动会改变 ns_*.npz 与 cs.pkl 的内容，而旧目录在
+# .pheasy_stamp_struct 未变时会静默复用旧零空间 -- 正是这类改动最该防的。
+# _SCRIPT_DIR 取脚本所在目录（pheasy_fit.sh 与 core/ 同处仓库根）；脚本若被
+# 拷进数据目录运行则 core/ 不可见，_CODE_FP 为空、不影响指纹（宽容降级）。
+_CODE_FP=""
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+for _f in core/symmetry_constraints.py core/cluster_orbit.py; do
+  if [ -f "$_SCRIPT_DIR/$_f" ]; then
+    _CODE_FP="$_CODE_FP $(_fp_hash "$_SCRIPT_DIR/$_f")"
+  fi
+done
+if [ -n "$_CODE_FP" ]; then
+  _stamp_struct="${_stamp_struct} | code:${_CODE_FP}"
+fi
 if [ -f .pheasy_stamp_struct ] && [ "$(cat .pheasy_stamp_struct)" != "$_stamp_struct" ]; then
   echo "结构/截断参数已变化，丢弃 cluster space、null space 与 sensing matrix："
   rm -f $_STRUCT_FILES $_DATA_FILES .pheasy_stamp_data .pheasy_stamp_ns

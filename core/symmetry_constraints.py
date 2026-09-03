@@ -221,20 +221,7 @@ class SymmetryConstraints(object):
                 else:
                     cons_rasr = self.build_rotational_invariance(clusters[2])
                 cons_mat_dict[order].append(cons_rasr)
-                # [DUMP] 临时: 导出完整 RASR 约束矩阵供离线诊断
-                import os as _os_d
-                if _os_d.environ.get("PHEASY_DUMP_RASR", "0") == "1":
-                    import scipy.sparse as _spd, numpy as _npd
-                    _parts = []
-                    for _cm in cons_rasr:
-                        _a = _cm.toarray() if _spd.issparse(_cm) else _npd.asarray(_cm)
-                        _parts.append(_spd.csr_matrix(_a))
-                    _Cfull = _spd.vstack(_parts, format='csr')
-                    _spd.save_npz(_os_d.path.join(
-                        _os_d.environ.get("PHEASY_DUMP_DIR", "."),
-                        "cons_rasr_full.npz"), _Cfull)
-                    print("[DUMP] cons_rasr_full.npz saved, shape={}, {} blocks".format(
-                        _Cfull.shape, len(cons_rasr)), flush=True)
+
 
             """Construct whole null space matrix of each order."""
             logger.info("- Calculating null space.")
